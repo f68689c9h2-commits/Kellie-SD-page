@@ -9,8 +9,14 @@
 <meta name="apple-mobile-web-app-title" content="Starter Calc">
 <link rel="apple-touch-icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxODAgMTgwIiB3aWR0aD0iMTgwIiBoZWlnaHQ9IjE4MCI+CiAgPHJlY3Qgd2lkdGg9IjE4MCIgaGVpZ2h0PSIxODAiIGZpbGw9IiMwRjBFMEMiIHJ4PSI0MCIvPgogIDx0ZXh0IHg9IjkwIiB5PSIxMjUiIAogICAgZm9udC1mYW1pbHk9Ii1hcHBsZS1zeXN0ZW0sIEhlbHZldGljYSBOZXVlLCBzYW5zLXNlcmlmIiAKICAgIGZvbnQtc2l6ZT0iMTEwIiAKICAgIGZvbnQtd2VpZ2h0PSI3MDAiIAogICAgZmlsbD0iI0U4Qjg0QiIgCiAgICB0ZXh0LWFuY2hvcj0ibWlkZGxlIj5TPC90ZXh0Pgo8L3N2Zz4=">
 <title>Sourdough Starter Calculator</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js" crossorigin></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+<script>
+if(typeof React==="undefined"){
+  document.write('<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin><\/script>');
+  document.write('<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin><\/script>');
+}
+</script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;background:#0F0E0C;overflow-x:hidden}
@@ -927,9 +933,13 @@ tab===4&&h(BakeLogTab,{bakeLog:bakeLog,onClearBakeLog:function(){setBakeLog([]);
 }
 
 var rootEl=document.getElementById(“root”);
-if(ReactDOM.createRoot){ReactDOM.createRoot(rootEl).render(h(App,null));}
-else{ReactDOM.render(h(App,null),rootEl);}
-// Force repaint on Safari to fix blank initial render
+if(typeof React===“undefined”||typeof ReactDOM===“undefined”){
+rootEl.innerHTML=’<div style="color:#E8B84B;font-family:sans-serif;padding:40px;text-align:center;"><div style="font-size:32px;margin-bottom:16px">⚠️</div><div style="font-size:18px;font-weight:600;margin-bottom:8px">Could not load app</div><div style="font-size:14px;color:#9B9180">Check your internet connection and reload the page.</div></div>’;
+}else if(ReactDOM.createRoot){
+ReactDOM.createRoot(rootEl).render(h(App,null));
+}else{
+ReactDOM.render(h(App,null),rootEl);
+}
 setTimeout(function(){document.body.style.display=“none”;document.body.offsetHeight;document.body.style.display=””;},100);
 })();
 </script>
