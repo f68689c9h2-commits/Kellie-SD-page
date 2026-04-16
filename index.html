@@ -1,0 +1,2278 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Starter Calc">
+<title>Sourdough Starter Calculator</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>*{box-sizing:border-box;margin:0;padding:0}html,body{height:100%;background:#0F0E0C}#root{height:100%}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+
+// ─── DESIGN TOKENS ────────────────────────────────────────────────────────────
+const C = {
+  bg:       "#0F0E0C",
+  surface:  "#1C1A16",
+  elevated: "#252218",
+  border:   "#3A3528",
+  borderHi: "#6B6040",
+  gold:     "#E8B84B",
+  goldDim:  "#A07E30",
+  white:    "#F5F0E8",
+  muted:    "#9B9180",
+  subtle:   "#6B6352",
+  green:    "#6FCF8A",
+  red:      "#E07060",
+  blue:     "#7AB8D4",
+  tan:      "#C8B878",
+};
+
+// ─── FERMENTATION MODEL ───────────────────────────────────────────────────────
+const BASE_PEAKS = { 1:4, 1.5:4.5, 2:5, 3:6, 4:7, 5:8, 6:9, 8:11, 10:14 };
+const BKEYS = Object.keys(BASE_PEAKS).map(Number).sort((a,b)=>a-b);
+
+function baseHours(ratio) {
+  if (ratio <= BKEYS[0]) return BASE_PEAKS[BKEYS[0]];
+  if (ratio >= BKEYS[BKEYS.length-1]) return BASE_PEAKS[BKEYS[BKEYS.length-1]];
+  for (let i=0; i<BKEYS.length-1; i++) {
+    const lo=BKEYS[i], hi=BKEYS[i+1];
+    if (ratio>=lo && ratio<=hi) {
+      return BASE_PEAKS[lo] + ((ratio-lo)/(hi-lo))*(BASE_PEAKS[hi]-BASE_PEAKS[lo]);
+    }
+  }
+  return 8;
+}
+
+// Flour speed multipliers (< 1.0 = faster)
+const BASE_FLOUR = {
+  ap:    { label:"Plain / All-purpose",     mult:1.00 },
+  bread: { label:"Baker's / Bread flour",   mult:0.95 },
+  wm:    { label:"Wholemeal / Whole wheat",  mult:0.86 },
+  rye:   { label:"Rye (100%)",              mult:0.90 },
+};
+const BOOST_FLOURS = [
+  { id:"none",  label:"None",                    spd:0 },
+  { id:"rye",   label:"Rye  ⚡ rocket fuel",      spd:0.006 },
+  { id:"wm",    label:"Wholemeal",               spd:0.005 },
+  { id:"spelt", label:"Spelt",                   spd:0.003 },
+];
+
+function flourMult(baseKey, boostId, boostPct) {
+  const base = BASE_FLOUR[baseKey]?.mult ?? 1.0;
+  const boost = BOOST_FLOURS.find(f=>f.id===boostId);
+  if (!boost || boostPct===0) return base;
+  return base * (1 - boost.spd * boostPct);
+}
+
+function flourDesc(baseKey, boostId, boostPct) {
+  const b = BASE_FLOUR[baseKey]?.label ?? "Plain";
+  if (boostId==="none" || boostPct===0) return b;
+  const bo = BOOST_FLOURS.find(f=>f.id===boostId);
+  return `${100-boostPct}% ${b.split("/")[0].trim()} + ${boostPct}% ${bo?.label.split(" ")[0]}`;
+}
+
+// starterBias: a nudge applied to peakHours based on user feedback history
+// stored as a multiplier, starts at 1.0
+function peakHours(ratio, tempC, fm=1.0, bias=1.0) {
+  return baseHours(ratio) * Math.pow(2, -(tempC-20)/5.5) * fm * bias;
+}
+
+const CANDIDATES = [1,1.5,2,3,4,5,6,8,10];
+function suggestRatio(hours, tempC, fm=1.0, bias=1.0) {
+  let best=CANDIDATES[0], bestDiff=Infinity;
+  for (const r of CANDIDATES) {
+    const diff = Math.abs(peakHours(r,tempC,fm,bias)-hours);
+    if (diff<bestDiff) { bestDiff=diff; best=r; }
+  }
+  return best;
+}
+
+function fmtRatio(r) { return `1 : ${r} : ${r}`; }
+function fmtH(h) {
+  if (h<=0) return "—";
+  const hrs=Math.floor(h), mins=Math.round((h-hrs)*60);
+  if (hrs===0) return `${mins}m`;
+  if (mins===0) return `${hrs}h`;
+  return `${hrs}h ${mins}m`;
+}
+function parseRatioStr(str) {
+  const p=str.split(":").map(s=>parseFloat(s.trim()));
+  if (p.length===3 && p.every(n=>!isNaN(n)&&n>0)) return p[1]/p[0];
+  return null;
+}
+// ─── TIME UTILITIES ───────────────────────────────────────────────────────────
+// All real-time operations work in the user's detected/selected timezone.
+// We use Intl for display so times always render correctly regardless of device TZ.
+
+function detectTimezone() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { return "Australia/Sydney"; }
+}
+
+// Common AU + global timezones for the picker
+const TIMEZONES = [
+  { label:"Sydney / Melbourne (AEDT)",  tz:"Australia/Sydney" },
+  { label:"Brisbane (AEST)",            tz:"Australia/Brisbane" },
+  { label:"Adelaide (ACDT)",            tz:"Australia/Adelaide" },
+  { label:"Perth (AWST)",               tz:"Australia/Perth" },
+  { label:"Darwin (ACST)",              tz:"Australia/Darwin" },
+  { label:"Hobart (AEDT)",              tz:"Australia/Hobart" },
+  { label:"Auckland (NZDT)",            tz:"Pacific/Auckland" },
+  { label:"London (GMT/BST)",           tz:"Europe/London" },
+  { label:"Paris / Berlin (CET/CEST)", tz:"Europe/Paris" },
+  { label:"New York (ET)",              tz:"America/New_York" },
+  { label:"Los Angeles (PT)",           tz:"America/Los_Angeles" },
+  { label:"Tokyo (JST)",                tz:"Asia/Tokyo" },
+  { label:"UTC",                        tz:"UTC" },
+];
+
+// Get current time string "HH:MM" in a given timezone
+function nowInTz(tz) {
+  const s = new Intl.DateTimeFormat("en-AU",{timeZone:tz,hour:"2-digit",minute:"2-digit",hour12:false}).format(new Date());
+  return s.replace(/^24:/,"00:"); // guard midnight edge
+}
+
+// Format a Date object as "HH:MM" 24h in given tz
+function dateTo24(d, tz) {
+  const s = new Intl.DateTimeFormat("en-AU",{timeZone:tz,hour:"2-digit",minute:"2-digit",hour12:false}).format(d);
+  return s.replace(/^24:/,"00:");
+}
+
+// Display time nicely: "8:30 am" style
+function fmtDisplay(timeStr24, tz) {
+  if (!timeStr24) return "—";
+  const [hh,mm] = timeStr24.split(":").map(Number);
+  const d = new Date();
+  d.setHours(hh, mm, 0, 0);
+  return new Intl.DateTimeFormat("en-AU",{timeZone:tz,hour:"numeric",minute:"2-digit",hour12:true}).format(d);
+}
+
+// Add hours to a "HH:MM" string, return new "HH:MM" (24h, may wrap past midnight)
+function addHoursToStr(timeStr, h) {
+  if (!timeStr) return null;
+  const [hh,mm] = timeStr.split(":").map(Number);
+  const totalMins = hh*60 + mm + Math.round(h*60);
+  const wrappedMins = ((totalMins % 1440) + 1440) % 1440;
+  const rh = Math.floor(wrappedMins/60), rm = wrappedMins%60;
+  return `${String(rh).padStart(2,"0")}:${String(rm).padStart(2,"0")}`;
+}
+
+// Subtract hours from a "HH:MM" string (work backwards)
+function subHoursFromStr(timeStr, h) {
+  return addHoursToStr(timeStr, -h);
+}
+
+// Hours difference between two "HH:MM" strings (from → to, wrapping midnight)
+function hoursBetween(fromStr, toStr) {
+  const toMins = s => { const [h,m]=s.split(":").map(Number); return h*60+m; };
+  let diff = toMins(toStr) - toMins(fromStr);
+  if (diff < 0) diff += 1440; // wrap midnight
+  return diff / 60;
+}
+
+// Legacy helper kept for FeedScheduler display
+function addHours(timeStr, h, tz="Australia/Sydney") {
+  const str24 = addHoursToStr(timeStr, h);
+  return fmtDisplay(str24, tz);
+}
+
+// Levain = 15% of flour (Kellie: 75g / 500g flour)
+function calcLevain(loaves, flourPL) { return Math.round(loaves*flourPL*0.15); }
+function calcFeed(levain, reserve, ratio, hyd) {
+  const total=levain+reserve;
+  const parts=1+ratio+ratio*hyd;
+  const seed=Math.round(total/parts);
+  const flour=Math.round(seed*ratio);
+  const water=Math.round(flour*hyd);
+  return { seed, flour, water, total:seed+flour+water, levain, reserve };
+}
+
+const LOAF_SIZES = [
+  { label:"Small  ~400g flour",  flour:400 },
+  { label:"Standard  ~500g flour", flour:500 },
+  { label:"Large  ~600g flour",  flour:600 },
+  { label:"Custom",              flour:null },
+];
+const RATIO_PRESETS = [
+  { label:"1 : 1 : 1  — same day fast",   value:1 },
+  { label:"1 : 1.5 : 1.5",                value:1.5 },
+  { label:"1 : 2 : 2  — daily standard",  value:2 },
+  { label:"1 : 3 : 3  — balanced rise",   value:3 },
+  { label:"1 : 4 : 4  — overnight boost", value:4 },
+  { label:"1 : 5 : 5  — slow build",      value:5 },
+  { label:"1 : 6 : 6  — long ferment",    value:6 },
+  { label:"1 : 8 : 8  — extended",        value:8 },
+  { label:"1 : 10 : 10  — maximum",       value:10 },
+  { label:"Custom ratio",                 value:"custom" },
+];
+const TABS = ["Planner","Scheduler","Hydration","Bake","History"];
+
+// ─── FEEDBACK / BIAS SYSTEM ──────────────────────────────────────────────────
+// We store a running bias multiplier and a history log in component state.
+// Feedback options: "early" (peaked before timer), "spot-on", "late" (peaked after)
+// Early → bias nudges down (shorten future estimates)
+// Late  → bias nudges up   (extend future estimates)
+// Nudge magnitude: 3% per feedback entry, capped ±25%
+const NUDGE = 0.03;
+function applyFeedback(currentBias, outcome) {
+  if (outcome==="early") return Math.max(currentBias - NUDGE, 0.75);
+  if (outcome==="late")  return Math.min(currentBias + NUDGE, 1.25);
+  return currentBias; // spot-on: no change
+}
+
+// ─── LOCALSTORAGE HELPERS ─────────────────────────────────────────────────────
+const LS_KEY = "sourdough_calc_v1";
+
+function loadStorage() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+function saveStorage(data) {
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify(data));
+  } catch { /* storage full or unavailable */ }
+}
+
+// ─── PUSH NOTIFICATION HELPERS ───────────────────────────────────────────────
+function notificationsSupported() {
+  return typeof Notification !== "undefined";
+}
+
+async function requestNotificationPermission() {
+  if (!notificationsSupported()) return "unsupported";
+  if (Notification.permission === "granted") return "granted";
+  if (Notification.permission === "denied") return "denied";
+  const result = await Notification.requestPermission();
+  return result;
+}
+
+function scheduleNotification(title, body, delayMs) {
+  if (!notificationsSupported() || Notification.permission !== "granted") return null;
+  const id = setTimeout(() => {
+    try {
+      new Notification(title, {
+        body,
+        icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🍞</text></svg>",
+        tag: "starter-peak",
+        renotify: true,
+      });
+    } catch(e) { console.log("Notification error:", e); }
+  }, delayMs);
+  return id;
+}
+
+function cancelNotification(id) {
+  if (id) clearTimeout(id);
+}
+
+// ─── ROOT APP ────────────────────────────────────────────────────────────────
+function App() {
+  const [tab, setTab] = useState(0);
+
+  // Initialise from localStorage if available
+  const [bias, setBias] = useState(()=>{
+    const s = loadStorage();
+    return s?.bias ?? 1.0;
+  });
+  const [history, setHistory] = useState(()=>{
+    const s = loadStorage();
+    return s?.history ?? [];
+  });
+  const [tz, setTz] = useState(()=>{
+    const s = loadStorage();
+    return s?.tz ?? detectTimezone();
+  });
+  const [starterName, setStarterName] = useState(()=>{
+    const s = loadStorage();
+    return s?.starterName ?? "";
+  });
+  const [notifPermission, setNotifPermission] = useState(()=>{
+    if (!notificationsSupported()) return "unsupported";
+    return Notification.permission;
+  });
+  const [showTzPicker, setShowTzPicker] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+
+  // Persist to localStorage whenever key state changes
+  useEffect(()=>{
+    saveStorage({ bias, history, tz, starterName });
+  }, [bias, history, tz, starterName]);
+
+  // Live clock — updates every 30s
+  const [nowStr, setNowStr] = useState(()=>nowInTz(tz));
+  useEffect(()=>{
+    const tick = ()=>setNowStr(nowInTz(tz));
+    tick();
+    const id = setInterval(tick, 30000);
+    return ()=>clearInterval(id);
+  },[tz]);
+
+  async function enableNotifications() {
+    const result = await requestNotificationPermission();
+    setNotifPermission(result);
+    return result;
+  }
+
+  function recordFeedback(entry, outcome) {
+    const newBias = applyFeedback(bias, outcome);
+    setBias(newBias);
+    setHistory(h => [{
+      ...entry,
+      outcome,
+      biasAfter: newBias,
+      date: new Date().toLocaleString("en-AU",{timeZone:tz,day:"numeric",month:"short",hour:"2-digit",minute:"2-digit",hour12:true}),
+    }, ...h].slice(0, 50));
+  }
+
+  const displayName = starterName || "your starter";
+  const tabIcons = ["🍞","🕐","💧","🔥","📋"];
+  const tzShort = TIMEZONES.find(t=>t.tz===tz)?.label.split(" ")[0] ?? tz;
+
+  return (
+    <div style={R.root}>
+      <style>{CSS}</style>
+
+      {/* HEADER */}
+      <div style={R.header}>
+        <div style={R.eyebrow}>Sourdough</div>
+        <div style={R.titleRow}>
+          <h1 style={R.title}>Starter</h1>
+          <h1 style={R.titleGold}>Calculator</h1>
+        </div>
+
+        {/* LIVE CLOCK + TZ + SETTINGS */}
+        <div style={{...R.clockRow, gap:8}}>
+          <div style={R.clock}>
+            <span style={R.clockTime}>{fmtDisplay(nowStr, tz)}</span>
+            <button style={R.tzBtn} onClick={()=>setShowTzPicker(p=>!p)}>
+              🌏 {tzShort} {showTzPicker?"▲":"▼"}
+            </button>
+          </div>
+          <button style={R.settingsBtn} onClick={()=>setShowSettings(p=>!p)} title="Settings">
+            ⚙️
+          </button>
+        </div>
+
+        {showTzPicker && (
+          <div style={R.tzPicker} className="fadeIn">
+            {TIMEZONES.map(t=>(
+              <button key={t.tz}
+                style={{...R.tzOption,...(tz===t.tz?R.tzOptionActive:{})}}
+                onClick={()=>{setTz(t.tz);setShowTzPicker(false);}}>
+                {tz===t.tz && <span style={{color:C.gold,marginRight:6}}>✓</span>}
+                {t.label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* SETTINGS PANEL */}
+        {showSettings && (
+          <div style={R.settingsPanel} className="fadeIn">
+            <div style={R.settingsTitle}>Settings</div>
+
+            {/* STARTER NAME */}
+            <div style={{marginBottom:16}}>
+              <div style={{fontSize:11,letterSpacing:"0.1em",textTransform:"uppercase",
+                color:C.muted,fontWeight:600,marginBottom:8}}>Starter name</div>
+              <input type="text"
+                style={{width:"100%",padding:"10px 12px",background:C.bg,
+                  border:`1.5px solid ${C.border}`,borderRadius:10,color:C.white,
+                  fontSize:15,fontFamily:"inherit",outline:"none",boxSizing:"border-box"}}
+                value={starterName}
+                onChange={e=>setStarterName(e.target.value)}
+                placeholder="e.g. Levvie, Frank, Breadly…"
+                maxLength={30}
+              />
+              <div style={{fontSize:12,color:C.subtle,marginTop:6}}>
+                Personalises the app and appears in notifications
+              </div>
+            </div>
+
+            {/* NOTIFICATIONS */}
+            <div style={{marginBottom:8}}>
+              <div style={{fontSize:11,letterSpacing:"0.1em",textTransform:"uppercase",
+                color:C.muted,fontWeight:600,marginBottom:8}}>Peak notifications</div>
+              {notifPermission==="unsupported" && (
+                <div style={{fontSize:13,color:C.subtle,lineHeight:1.6}}>
+                  Notifications aren't supported in this browser. Add the app to your home screen from Safari for full notification support.
+                </div>
+              )}
+              {notifPermission==="denied" && (
+                <div style={{fontSize:13,color:C.red,lineHeight:1.6}}>
+                  Notifications blocked. Go to your phone's Settings → Safari → Notifications to allow them for this app.
+                </div>
+              )}
+              {notifPermission==="default" && (
+                <div>
+                  <div style={{fontSize:13,color:C.muted,lineHeight:1.6,marginBottom:10}}>
+                    Get notified when your starter is near peak — even when your screen is locked.
+                    {" "}<strong style={{color:C.white}}>Add to home screen first</strong> for this to work on iPhone.
+                  </div>
+                  <button style={{...F.goBtn,marginTop:0,background:C.gold,padding:"11px 0"}}
+                    onClick={enableNotifications}>
+                    Enable notifications
+                  </button>
+                </div>
+              )}
+              {notifPermission==="granted" && (
+                <div style={{display:"flex",alignItems:"center",gap:8,fontSize:13,color:C.green}}>
+                  <span>✓</span>
+                  <span>Notifications enabled — you'll get an alert when your starter is near peak</span>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {bias !== 1.0 && (
+          <div style={{...R.biasBadge,marginTop:8}}>
+            Model calibrated — {bias<1?"running faster":"running slower"} than baseline
+            <button style={R.biasReset} onClick={()=>setBias(1.0)}>Reset</button>
+          </div>
+        )}
+      </div>
+
+      {/* TAB BAR */}
+      <div style={R.tabBar}>
+        {TABS.map((label,i)=>(
+          <button key={i} style={{...R.tabBtn,...(tab===i?R.tabActive:{})}}
+            onClick={()=>setTab(i)}>
+            <span style={R.tabIcon}>{tabIcons[i]}</span>
+            <span style={R.tabLabel}>{label}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* BODY */}
+      <div style={R.body}>
+        {tab===0 && <LevainPlanner bias={bias} onFeedback={recordFeedback} tz={tz} nowStr={nowStr} starterName={displayName} notifPermission={notifPermission} onEnableNotif={enableNotifications} />}
+        {tab===1 && <FeedScheduler bias={bias} onFeedback={recordFeedback} tz={tz} nowStr={nowStr} starterName={displayName} notifPermission={notifPermission} onEnableNotif={enableNotifications} />}
+        {tab===2 && <HydrationCalc />}
+        {tab===3 && <BakeGuide />}
+        {tab===4 && <HistoryTab history={history} bias={bias} onReset={()=>{
+          setBias(1.0);
+          setHistory([]);
+          saveStorage({bias:1.0, history:[], tz});
+        }} />}
+      </div>
+    </div>
+  );
+}
+
+// ─── TAB 1: LEVAIN PLANNER ───────────────────────────────────────────────────
+function LevainPlanner({ bias, onFeedback, tz, nowStr, starterName, notifPermission, onEnableNotif }) {
+  const [dayType, setDayType]     = useState(null); // null | "feed" | "dough"
+  const [mode, setMode]           = useState("suggest");
+  const [timeMode, setTimeMode]   = useState("mixby");
+  const [mixByTime, setMixByTime] = useState(()=> addHoursToStr(nowStr, 8));
+  const [feedAtTime, setFeedAtTime] = useState(()=> nowStr);
+  const [tempC, setTempC]         = useState(22);
+  const [loaves, setLoaves]       = useState(1);
+  const [sizeIdx, setSizeIdx]     = useState(1);
+  const [customFlour, setCustomFlour] = useState(500);
+  const [ratioPreset, setRatioPreset] = useState(2);
+  const [customRatioStr, setCustomRatioStr] = useState("1:3:3");
+  const [hydration, setHydration] = useState(1.0);
+  const [reserve, setReserve]     = useState(50);
+  const [reserveMode, setReserveMode] = useState("preset");
+  const [customReserve, setCustomReserve] = useState(50);
+  const [baseFlour, setBaseFlour] = useState("ap");
+  const [boostFlour, setBoostFlour] = useState("none");
+  const [boostMode, setBoostMode] = useState("pct");
+  const [boostPct, setBoostPct]   = useState(10);
+  const [boostG, setBoostG]       = useState(10);
+  // Starter in jar
+  const [jarMode, setJarMode]     = useState("unknown"); // "unknown" | "known"
+  const [jarG, setJarG]           = useState(100);
+  const [result, setResult]       = useState(null);
+  const [err, setErr]             = useState(null);
+
+  // Keep time inputs loosely in sync with live clock on mount
+  useEffect(()=>{
+    setFeedAtTime(nowStr);
+    setMixByTime(addHoursToStr(nowStr, 8));
+  // eslint-disable-next-line
+  },[]);
+
+  const flourPL  = LOAF_SIZES[sizeIdx].flour ?? customFlour;
+  const reserveG = reserveMode==="preset" ? reserve : customReserve;
+
+  function getFm(feedFlour) {
+    const pct = boostFlour==="none" ? 0
+      : boostMode==="pct" ? boostPct
+      : Math.round((boostG/Math.max(feedFlour,1))*100);
+    return flourMult(baseFlour, boostFlour, Math.min(pct,80));
+  }
+
+  function calculate() {
+    setErr(null);
+    const levain = calcLevain(loaves, flourPL);
+    const roughFeed = calcFeed(levain, reserveG, 2, hydration);
+    const fm = getFm(roughFeed.flour);
+
+    // Helper: given a feed result, check if we have enough starter in the jar
+    // seed = what the ratio needs; jar = what's actually there
+    // If jar is known and less than seed needed, flag it and recalculate using jar amount
+    function withJarCheck(feed, ratio) {
+      if (jarMode !== "known") return { feed, ratio, jarWarning: null };
+      const seedNeeded = feed.seed;
+      if (jarG >= seedNeeded + reserveG) {
+        // All good — jar has enough for seed + reserve
+        return { feed, ratio, jarWarning: null };
+      }
+      if (jarG < reserveG + 5) {
+        // Not enough even for reserve
+        return { feed, ratio, jarWarning: "not-enough" };
+      }
+      // Jar has some but less than ideal — use what's available as seed
+      const availSeed = Math.max(jarG - reserveG, 5);
+      const adjustedFeed = calcFeed(levain, reserveG, ratio, hydration);
+      // Recalc: work out what ratio this seed amount implies relative to levain needed
+      const impliedRatio = availSeed > 0 ? Math.round((levain / availSeed) * 10) / 10 : ratio;
+      const constrainedFeed = {
+        seed: availSeed,
+        flour: Math.round(availSeed * ratio),
+        water: Math.round(availSeed * ratio * hydration),
+        total: availSeed + Math.round(availSeed * ratio) + Math.round(availSeed * ratio * hydration),
+        levain: feed.levain,
+        reserve: reserveG,
+      };
+      return {
+        feed: constrainedFeed,
+        ratio,
+        jarWarning: "constrained",
+        seedNeeded,
+        availSeed,
+        shortfall: seedNeeded - availSeed,
+      };
+    }
+
+    let hoursAvail, feedStr, peakStr;
+
+    if (mode==="suggest") {
+      if (timeMode==="mixby") {
+        hoursAvail = hoursBetween(nowStr, mixByTime);
+        if (hoursAvail < 0.5) { setErr("Mix time needs to be at least 30 minutes from now"); return; }
+        feedStr = nowStr;
+        const ratio = suggestRatio(hoursAvail, tempC, fm, bias);
+        const peak = peakHours(ratio, tempC, fm, bias);
+        peakStr = addHoursToStr(nowStr, peak);
+        const feed = calcFeed(levain, reserveG, ratio, hydration);
+        const { feed: finalFeed, jarWarning, seedNeeded, availSeed, shortfall } = withJarCheck(feed, ratio);
+        const bPct = Math.round((levain/(loaves*flourPL))*100);
+        const finalBoostPct = boostMode==="pct" ? boostPct : Math.round((boostG/Math.max(feed.flour,1))*100);
+        setResult({
+          ratio, peak, feed: finalFeed, levain, bPct, loaves, flourPL, fm, bias,
+          flourLabel: flourDesc(baseFlour, boostFlour, finalBoostPct),
+          baseFlour, boostFlour, boostPct: finalBoostPct,
+          feedStr, peakStr, mixByStr: mixByTime, timeMode, tz,
+          jarG: jarMode==="known" ? jarG : null, jarWarning, seedNeeded, availSeed, shortfall,
+        });
+      } else {
+        feedStr = feedAtTime;
+        const ratio = suggestRatio(8, tempC, fm, bias);
+        const peak = peakHours(ratio, tempC, fm, bias);
+        peakStr = addHoursToStr(feedAtTime, peak);
+        const feed = calcFeed(levain, reserveG, ratio, hydration);
+        const { feed: finalFeed, jarWarning, seedNeeded, availSeed, shortfall } = withJarCheck(feed, ratio);
+        const bPct = Math.round((levain/(loaves*flourPL))*100);
+        const finalBoostPct = boostMode==="pct" ? boostPct : Math.round((boostG/Math.max(feed.flour,1))*100);
+        setResult({
+          ratio, peak, feed: finalFeed, levain, bPct, loaves, flourPL, fm, bias,
+          flourLabel: flourDesc(baseFlour, boostFlour, finalBoostPct),
+          baseFlour, boostFlour, boostPct: finalBoostPct,
+          feedStr, peakStr, timeMode, tz,
+          jarG: jarMode==="known" ? jarG : null, jarWarning, seedNeeded, availSeed, shortfall,
+        });
+      }
+    } else {
+      const ratio = ratioPreset==="custom" ? parseRatioStr(customRatioStr) : ratioPreset;
+      if (!ratio) { setErr("Can't parse that ratio — try 1:2:2 or 1:5:5"); return; }
+      feedStr = timeMode==="mixby" ? nowStr : feedAtTime;
+      const peak = peakHours(ratio, tempC, fm, bias);
+      peakStr = addHoursToStr(feedStr, peak);
+      const feed = calcFeed(levain, reserveG, ratio, hydration);
+      const { feed: finalFeed, jarWarning, seedNeeded, availSeed, shortfall } = withJarCheck(feed, ratio);
+      const bPct = Math.round((levain/(loaves*flourPL))*100);
+      const finalBoostPct = boostMode==="pct" ? boostPct : Math.round((boostG/Math.max(feed.flour,1))*100);
+      setResult({
+        ratio, peak, feed: finalFeed, levain, bPct, loaves, flourPL, fm, bias,
+        flourLabel: flourDesc(baseFlour, boostFlour, finalBoostPct),
+        baseFlour, boostFlour, boostPct: finalBoostPct,
+        feedStr, peakStr,
+        mixByStr: timeMode==="mixby" ? mixByTime : null,
+        timeMode, tz,
+        jarG: jarMode==="known" ? jarG : null, jarWarning, seedNeeded, availSeed, shortfall,
+      });
+    }
+  }
+
+  return (
+    <div>
+
+      {/* ── DAY TYPE GATE ─────────────────────────────────────── */}
+      <SectionHead>What are you doing today?</SectionHead>
+      <div style={{display:"flex",gap:10,marginBottom:24}}>
+        {[
+          { id:"feed",  icon:"🥄", title:"Feed day",  sub:"Maintain my starter, no baking today" },
+          { id:"dough", icon:"🍞", title:"Dough day",  sub:"Building levain to mix dough and bake" },
+        ].map(d=>(
+          <button key={d.id} onClick={()=>{setDayType(d.id);setResult(null);setErr(null);}}
+            style={{flex:1,padding:"14px 10px",textAlign:"center",
+              background:dayType===d.id?C.elevated:C.bg,
+              border:`1.5px solid ${dayType===d.id?C.gold+"88":C.border}`,
+              borderRadius:12,color:dayType===d.id?C.white:C.muted,
+              cursor:"pointer",fontFamily:"inherit"}}>
+            <div style={{fontSize:26,marginBottom:6}}>{d.icon}</div>
+            <div style={{fontSize:14,fontWeight:dayType===d.id?700:400,marginBottom:3}}>{d.title}</div>
+            <div style={{fontSize:11,color:dayType===d.id?C.muted:C.subtle,lineHeight:1.4}}>{d.sub}</div>
+          </button>
+        ))}
+      </div>
+
+      {/* ── FEED ONLY ─────────────────────────────────────────── */}
+      {dayType==="feed" && <FeedOnlyPlanner
+        bias={bias} tz={tz} nowStr={nowStr}
+        baseFlour={baseFlour} setBaseFlour={setBaseFlour}
+        boostFlour={boostFlour} setBoostFlour={setBoostFlour}
+        boostMode={boostMode} setBoostMode={setBoostMode}
+        boostPct={boostPct} setBoostPct={setBoostPct}
+        boostG={boostG} setBoostG={setBoostG}
+        reserve={reserve} setReserve={setReserve}
+        reserveMode={reserveMode} setReserveMode={setReserveMode}
+        customReserve={customReserve} setCustomReserve={setCustomReserve}
+        jarMode={jarMode} setJarMode={setJarMode}
+        jarG={jarG} setJarG={setJarG}
+        tempC={tempC} setTempC={setTempC}
+        hydration={hydration} setHydration={setHydration}
+      />}
+
+      {/* ── DOUGH DAY ─────────────────────────────────────────── */}
+      {dayType==="dough" && <>
+      {/* MODE TOGGLE */}
+      <Toggle
+        options={[{id:"suggest",label:"Suggest ratio"},{id:"manual",label:"I choose"}]}
+        value={mode} onChange={v=>{setMode(v);setResult(null);setErr(null);}} />
+
+      <Spacer />
+
+      {/* TIME MODE */}
+      <SectionHead>Timing</SectionHead>
+      <Toggle
+        options={[{id:"mixby",label:"I mix dough at…"},{id:"feedat",label:"I feed at…"}]}
+        value={timeMode} onChange={v=>{setTimeMode(v);setResult(null);}} />
+
+      <div style={{marginTop:14}}>
+        {timeMode==="mixby" ? (
+          <div style={F.field}>
+            <Label>Mix dough by</Label>
+            <input type="time" style={{...F.sel, colorScheme:"dark", fontSize:18, fontWeight:600}}
+              value={mixByTime} onChange={e=>{setMixByTime(e.target.value);setResult(null);}} />
+            <div style={F.timeDisplay}>
+              <span style={F.timeNow}>Now: {fmtDisplay(nowStr, tz)}</span>
+              <span style={F.timeArrow}>→</span>
+              <span style={F.timeMix}>Mix: {fmtDisplay(mixByTime, tz)}</span>
+              <span style={F.timeWindow}>
+                {hoursBetween(nowStr, mixByTime) >= 0.5
+                  ? `${fmtH(hoursBetween(nowStr, mixByTime))} window`
+                  : "⚠ Too soon"}
+              </span>
+            </div>
+            <Hint>Feed now — starter peaks in time for your mix</Hint>
+          </div>
+        ) : (
+          <div style={F.field}>
+            <Label>Feed starter at</Label>
+            <input type="time" style={{...F.sel, colorScheme:"dark", fontSize:18, fontWeight:600}}
+              value={feedAtTime} onChange={e=>{setFeedAtTime(e.target.value);setResult(null);}} />
+            <div style={F.timeDisplay}>
+              <span style={F.timeNow}>Feed: {fmtDisplay(feedAtTime, tz)}</span>
+              <span style={F.timeArrow}>→</span>
+              <span style={F.timeMix}>Peak: calculated after</span>
+            </div>
+            <Hint>Starter peaks and you mix dough after that</Hint>
+          </div>
+        )}
+      </div>
+
+      <Spacer />
+
+      {/* TEMP */}
+      <SliderField label="Kitchen temperature" display={`${tempC}°C`}
+        min={14} max={34} step={0.5} value={tempC} onChange={setTempC}
+        hint={tempHint(tempC)} lo="14°C" hi="34°C" />
+
+      {/* LOAVES + SIZE */}
+      <div style={F.row}>
+        <div style={{flex:"0 0 auto"}}>
+          <Label>Loaves</Label>
+          <Stepper value={loaves} onChange={setLoaves} min={1} />
+        </div>
+        <div style={{flex:1}}>
+          <Label>Loaf size</Label>
+          <Select value={sizeIdx} onChange={v=>setSizeIdx(+v)}>
+            {LOAF_SIZES.map((l,i)=><option key={i} value={i}>{l.label}</option>)}
+          </Select>
+          {sizeIdx===3 && <NumInput value={customFlour} onChange={setCustomFlour} min={100} max={2000} placeholder="Flour per loaf (g)" />}
+        </div>
+      </div>
+
+      <Spacer />
+
+      {/* MANUAL RATIO */}
+      {mode==="manual" && (
+        <div style={F.field}>
+          <Label>Feeding ratio</Label>
+          <Select value={ratioPreset} onChange={v=>setRatioPreset(v==="custom"?"custom":parseFloat(v))}>
+            {RATIO_PRESETS.map((r,i)=><option key={i} value={r.value}>{r.label}</option>)}
+          </Select>
+          {ratioPreset==="custom" && (
+            <TextInput value={customRatioStr} onChange={setCustomRatioStr} placeholder="e.g. 1:3:3" />
+          )}
+          <Spacer />
+        </div>
+      )}
+
+      {/* HYDRATION — advanced, collapsed by default */}
+      <AdvancedToggle label="Starter hydration" defaultNote="100% — equal flour and water (standard)">
+        <SliderField label={`Hydration  ${Math.round(hydration*100)}%`}
+          display="" min={0.6} max={1.25} step={0.05} value={hydration} onChange={setHydration}
+          hint={hydration===1?"100% — equal flour and water":hydration<1?"Stiffer starter (pasta madre) — slower fermentation, less acidity, richer dough":"Wetter starter — faster, more active, easier to stir"}
+          lo="60%" hi="125%" />
+      </AdvancedToggle>
+
+      <Spacer />
+
+      {/* FLOUR */}
+      <SectionHead>Flour blend</SectionHead>
+      <div style={F.field}>
+        <Label>Base flour</Label>
+        <Select value={baseFlour} onChange={v=>{setBaseFlour(v);setResult(null);}}>
+          {Object.entries(BASE_FLOUR).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}
+        </Select>
+        <Hint>{baseFlourHint(baseFlour)}</Hint>
+      </div>
+      <div style={F.field}>
+        <Label>Boost flour <span style={{color:C.subtle,fontWeight:"normal",letterSpacing:0,textTransform:"none",fontSize:12}}>(optional)</span></Label>
+        <Select value={boostFlour} onChange={v=>{setBoostFlour(v);setResult(null);}}>
+          {BOOST_FLOURS.map(f=><option key={f.id} value={f.id}>{f.label}</option>)}
+        </Select>
+        {boostFlour!=="none" && (
+          <div style={{marginTop:12}}>
+            <Toggle
+              options={[{id:"pct",label:"By %"},{id:"grams",label:"By grams"}]}
+              value={boostMode} onChange={setBoostMode} small />
+            <div style={{marginTop:12}}>
+              {boostMode==="pct" ? (
+                <SliderField label="Amount" display={`${boostPct}%`}
+                  min={5} max={50} step={5} value={boostPct} onChange={v=>{setBoostPct(v);setResult(null);}}
+                  hint={boostHint(boostPct)} lo="5%" hi="50%" />
+              ) : (
+                <div style={F.field}>
+                  <Label>Grams of boost flour</Label>
+                  <NumInput value={boostG} onChange={v=>{setBoostG(v);setResult(null);}} min={1} max={200} placeholder="e.g. 10g" />
+                  <Hint>Will be expressed as % of your total feed flour</Hint>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <Spacer />
+
+      {/* STARTER IN JAR */}
+      <SectionHead>Starter in jar</SectionHead>
+      <div style={F.field}>
+        <Label>How much starter do you have right now?</Label>
+        <div style={F.chipRow}>
+          <Chip active={jarMode==="unknown"} onClick={()=>setJarMode("unknown")}>Not sure</Chip>
+          {[50,80,100,120,150,200].map(g=>(
+            <Chip key={g} active={jarMode==="known"&&jarG===g}
+              onClick={()=>{setJarMode("known");setJarG(g);}}>{g}g</Chip>
+          ))}
+          <Chip active={jarMode==="known"&&![50,80,100,120,150,200].includes(jarG)}
+            onClick={()=>setJarMode("known")}>Custom</Chip>
+        </div>
+        {jarMode==="known" && (
+          <div style={{marginTop:10}}>
+            <div style={F.labelRow}>
+              <span style={{...F.label,marginBottom:0,fontSize:11,letterSpacing:"0.1em",textTransform:"uppercase",color:C.muted,fontWeight:600}}>Amount in jar</span>
+              <span style={{fontSize:22,color:C.gold,fontWeight:600}}>{jarG}g</span>
+            </div>
+            <input type="range" min={10} max={500} step={10} value={jarG}
+              onChange={e=>setJarG(+e.target.value)}
+              className="rng" style={F.range} />
+            <div style={F.rangeEnds}><span>10g</span><span>500g</span></div>
+            <div style={{marginTop:8,display:"flex",gap:8,flexWrap:"wrap"}}>
+              {[50,80,100,120,150,200].map(g=>(
+                <button key={g} onClick={()=>setJarG(g)}
+                  style={{padding:"5px 12px",background:jarG===g?C.elevated:C.bg,
+                    border:`1px solid ${jarG===g?C.gold+"66":C.border}`,borderRadius:16,
+                    color:jarG===g?C.gold:C.subtle,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
+                  {g}g
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        <Hint>{jarMode==="unknown" ? "App will calculate the starter amount from scratch" : "App will check you have enough and adjust if needed"}</Hint>
+      </div>
+
+      <Spacer />
+
+      {/* RESERVE */}
+      <SectionHead>Starter reserve</SectionHead>
+      <div style={F.field}>
+        <Label>Keep back in jar</Label>
+        <div style={F.chipRow}>
+          {[20,30,50,75,100].map(g=>(
+            <Chip key={g} active={reserveMode==="preset"&&reserve===g}
+              onClick={()=>{setReserveMode("preset");setReserve(g);}}>{g}g</Chip>
+          ))}
+          <Chip active={reserveMode==="custom"} onClick={()=>setReserveMode("custom")}>Custom</Chip>
+        </div>
+        {reserveMode==="custom" && (
+          <NumInput value={customReserve} onChange={setCustomReserve} min={5} max={500} placeholder="Reserve (g)" />
+        )}
+        <Hint>Stays in the jar — not going into the dough</Hint>
+      </div>
+
+      {err && <ErrBox>{err}</ErrBox>}
+
+      <button style={F.goBtn} className="goBtn" onClick={calculate}>Calculate feed</button>
+
+      {result && <LevainResult result={result} tempC={tempC} loaves={loaves} onFeedback={onFeedback}
+        boostFlour={boostFlour} boostPct={result.boostPct} baseFlour={baseFlour} tz={tz}
+        starterName={starterName} notifPermission={notifPermission} onEnableNotif={onEnableNotif} />}
+      </>}
+    </div>
+  );
+}
+
+// ─── FEED ONLY PLANNER ───────────────────────────────────────────────────────
+function FeedOnlyPlanner({ bias, tz, nowStr, baseFlour, setBaseFlour, boostFlour, setBoostFlour,
+  boostMode, setBoostMode, boostPct, setBoostPct, boostG, setBoostG,
+  reserve, setReserve, reserveMode, setReserveMode, customReserve, setCustomReserve,
+  jarMode, setJarMode, jarG, setJarG, tempC, setTempC, hydration, setHydration }) {
+
+  const [destination, setDestination] = useState("counter"); // "counter" | "fridge"
+  const [ratioPreset, setRatioPreset] = useState(2);
+  const [customRatioStr, setCustomRatioStr] = useState("1:2:2");
+  const [keepG, setKeepG]     = useState(100); // how much total starter to maintain
+  const [result, setResult]   = useState(null);
+  const [err, setErr]         = useState(null);
+
+  const reserveG = reserveMode==="preset" ? reserve : customReserve;
+
+  function calculate() {
+    setErr(null);
+    const ratio = ratioPreset==="custom" ? parseRatioStr(customRatioStr) : ratioPreset;
+    if (!ratio) { setErr("Can't parse that ratio — try 1:2:2 or 1:5:5"); return; }
+
+    // Feed only: no levain needed — just maintain the starter
+    // Total output = keepG. Split by ratio to get seed, flour, water.
+    const fm = flourMult(baseFlour, boostFlour, boostFlour==="none"?0:boostPct);
+    const parts = 1 + ratio + ratio * hydration;
+    const seed  = Math.round(keepG / parts);
+    const flour = Math.round(seed * ratio);
+    const water = Math.round(flour * hydration);
+    const total = seed + flour + water;
+    const peak  = peakHours(ratio, tempC, fm, bias);
+
+    // Jar check
+    let jarWarning = null;
+    if (jarMode==="known") {
+      if (jarG < seed + 5) jarWarning = "low";
+    }
+
+    setResult({
+      ratio, peak, seed, flour, water, total, keepG,
+      destination, fm,
+      flourLabel: flourDesc(baseFlour, boostFlour, boostFlour==="none"?0:boostPct),
+      jarWarning,
+    });
+  }
+
+  return (
+    <div>
+      {/* DESTINATION */}
+      <SectionHead>Where is the starter going after feeding?</SectionHead>
+      <Toggle
+        options={[{id:"counter",label:"Staying on the counter"},{id:"fridge",label:"Going in the fridge"}]}
+        value={destination} onChange={v=>{setDestination(v);setResult(null);}} />
+
+      {destination==="fridge" && (
+        <div style={{marginTop:10}}>
+          <Hint>Fridge slows fermentation to a crawl — starter keeps for 1–2 weeks. Use a higher ratio (1:4:4 or more) before refrigerating so it has plenty of food.</Hint>
+        </div>
+      )}
+      {destination==="counter" && (
+        <div style={{marginTop:10}}>
+          <Hint>On the counter it'll peak and need feeding again in {tempC>=25?"4–6":"8–12"} hours at your current temperature. Use a higher ratio to extend the window.</Hint>
+        </div>
+      )}
+
+      <Spacer />
+
+      {/* TEMP */}
+      <SliderField label="Kitchen temperature" display={`${tempC}°C`}
+        min={14} max={34} step={0.5} value={tempC} onChange={setTempC}
+        hint={tempHint(tempC)} lo="14°C" hi="34°C" />
+
+      {/* RATIO */}
+      <div style={F.field}>
+        <Label>Feeding ratio</Label>
+        <Select value={ratioPreset} onChange={v=>setRatioPreset(v==="custom"?"custom":parseFloat(v))}>
+          {RATIO_PRESETS.map((r,i)=><option key={i} value={r.value}>{r.label}</option>)}
+        </Select>
+        {ratioPreset==="custom" && (
+          <TextInput value={customRatioStr} onChange={setCustomRatioStr} placeholder="e.g. 1:3:3" />
+        )}
+        {destination==="fridge" && ratioPreset < 3 && (
+          <div style={{marginTop:8,background:"#1E1A0A",border:`1px solid ${C.gold}44`,
+            borderRadius:8,padding:"8px 12px",fontSize:12,color:C.muted}}>
+            💡 For fridge storage, a ratio of 1:3:3 or higher is recommended — gives the starter enough food to last until your next bake.
+          </div>
+        )}
+      </div>
+
+      {/* HOW MUCH TO KEEP */}
+      <div style={F.field}>
+        <div style={F.labelRow}>
+          <Label noMargin>How much starter to end up with</Label>
+          <span style={{fontSize:22,color:C.gold,fontWeight:600}}>{keepG}g</span>
+        </div>
+        <input type="range" min={30} max={400} step={10} value={keepG}
+          onChange={e=>{setKeepG(+e.target.value);setResult(null);}}
+          className="rng" style={F.range} />
+        <div style={F.rangeEnds}><span>30g</span><span>400g</span></div>
+        <Hint>{destination==="fridge"?"Keep 50–100g in the fridge — enough for a bake without wasting flour":"Keep 50–150g on the counter for regular baking"}</Hint>
+      </div>
+
+      {/* FLOUR */}
+      <SectionHead>Flour</SectionHead>
+      <div style={F.field}>
+        <Label>Base flour</Label>
+        <Select value={baseFlour} onChange={v=>{setBaseFlour(v);setResult(null);}}>
+          {Object.entries(BASE_FLOUR).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}
+        </Select>
+      </div>
+      <div style={F.field}>
+        <Label>Boost flour <span style={{color:C.subtle,fontWeight:"normal",textTransform:"none",fontSize:12}}>(optional)</span></Label>
+        <Select value={boostFlour} onChange={v=>{setBoostFlour(v);setResult(null);}}>
+          {BOOST_FLOURS.map(f=><option key={f.id} value={f.id}>{f.label}</option>)}
+        </Select>
+        {boostFlour!=="none" && (
+          <SliderField label="Amount" display={`${boostPct}%`}
+            min={5} max={50} step={5} value={boostPct}
+            onChange={v=>{setBoostPct(v);setResult(null);}}
+            hint={boostHint(boostPct)} lo="5%" hi="50%" />
+        )}
+      </div>
+
+      {/* STARTER IN JAR */}
+      <SectionHead>Starter in jar</SectionHead>
+      <div style={F.field}>
+        <Label>How much do you have right now?</Label>
+        <div style={F.chipRow}>
+          <Chip active={jarMode==="unknown"} onClick={()=>setJarMode("unknown")}>Not sure</Chip>
+          {[20,30,50,75,100,150].map(g=>(
+            <Chip key={g} active={jarMode==="known"&&jarG===g}
+              onClick={()=>{setJarMode("known");setJarG(g);}}>{g}g</Chip>
+          ))}
+          <Chip active={jarMode==="known"&&![20,30,50,75,100,150].includes(jarG)}
+            onClick={()=>setJarMode("known")}>Custom</Chip>
+        </div>
+        {jarMode==="known" && (
+          <div style={{marginTop:10}}>
+            <div style={F.labelRow}>
+              <span style={{fontSize:11,letterSpacing:"0.1em",textTransform:"uppercase",color:C.muted,fontWeight:600}}>Amount in jar</span>
+              <span style={{fontSize:22,color:C.gold,fontWeight:600}}>{jarG}g</span>
+            </div>
+            <input type="range" min={10} max={400} step={10} value={jarG}
+              onChange={e=>{setJarG(+e.target.value);setResult(null);}}
+              className="rng" style={F.range} />
+            <div style={F.rangeEnds}><span>10g</span><span>400g</span></div>
+          </div>
+        )}
+      </div>
+
+      {err && <ErrBox>{err}</ErrBox>}
+      <button style={F.goBtn} className="goBtn" onClick={calculate}>Calculate feed</button>
+
+      {result && (
+        <div style={F.results} className="fadeIn">
+          <SectionHead>Your maintenance feed</SectionHead>
+
+          {result.flourLabel && (
+            <div style={F.flourTag}>
+              <span style={{color:C.gold}}>🌾</span>
+              <span style={{color:C.white,fontWeight:600}}>{result.flourLabel}</span>
+            </div>
+          )}
+
+          {/* JAR WARNING */}
+          {result.jarWarning==="low" && (
+            <div style={{background:"#2A0E0A",border:`1px solid ${C.red}55`,borderRadius:12,
+              padding:"12px 14px",marginBottom:12,fontSize:13,color:C.red,lineHeight:1.6}}>
+              ⚠ You only have {jarG}g in the jar but the feed needs {result.seed}g as starter.
+              Use what you have — the output will be smaller but it'll still work.
+            </div>
+          )}
+
+          {/* FEED AMOUNTS */}
+          <Card>
+            <CardHead>What goes in the jar <Bdg>{result.total}g total</Bdg></CardHead>
+            <div style={F.pillRow}>
+              <BigPill label="Starter" g={result.seed} color={C.gold} />
+              <PlusSign />
+              <BigPill label="Flour" g={result.flour} color={C.tan} />
+              <PlusSign />
+              <BigPill label="Water" g={result.water} color={C.blue} />
+            </div>
+          </Card>
+
+          {/* COUNTER OR FRIDGE GUIDANCE */}
+          {destination==="counter" ? (
+            <Card>
+              <CardHead>Counter storage</CardHead>
+              <div style={F.tiles}>
+                <Tile label="Est. peak" big={fmtH(result.peak)} sub={`at ${tempC}°C`} highlight />
+                <Tile label="Feed again" big={`after peak`} sub="don't let it collapse" />
+              </div>
+              <div style={{fontSize:13,color:C.muted,lineHeight:1.7,marginTop:8}}>
+                Feed again once it peaks and starts to fall — or use it in a recipe.
+                At {tempC}°C you'll need to feed roughly every {tempC>=26?"4–6":tempC>=22?"8–10":"12–16"} hours.
+              </div>
+            </Card>
+          ) : (
+            <Card>
+              <CardHead>Fridge storage</CardHead>
+              <div style={{fontSize:13,color:C.muted,lineHeight:1.8}}>
+                <div>🧊 <strong style={{color:C.white}}>Put it in straight after feeding</strong> — don't wait for it to peak first.</div>
+                <div>📅 <strong style={{color:C.white}}>Feed again in 1–2 weeks</strong> — or whenever you're ready to bake.</div>
+                <div>⏰ <strong style={{color:C.white}}>Before baking</strong> — take it out, let it warm up 1–2 hours, then feed and wait for peak.</div>
+                <div>💡 <strong style={{color:C.white}}>A layer of liquid (hooch) on top</strong> is normal — just stir it back in or pour it off.</div>
+              </div>
+            </Card>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+function LevainResult({ result, tempC, loaves, onFeedback, boostFlour, boostPct, baseFlour, tz, starterName, notifPermission, onEnableNotif }) {
+  const [feedbackDone, setFeedbackDone] = useState(false);
+  return (
+    <div style={F.results} className="fadeIn">
+      <SectionHead>Your feed plan</SectionHead>
+
+      {/* FLOUR TAG */}
+      {result.flourLabel && (
+        <div style={F.flourTag}>
+          <span style={{color:C.gold}}>🌾</span>
+          <span style={{color:C.white,fontWeight:600}}>{result.flourLabel}</span>
+          {result.fm<0.95 && <span style={{color:C.green,fontSize:12}}> ↑ {Math.round((1-result.fm)*100)}% faster</span>}
+        </div>
+      )}
+
+      {/* TIME TIMELINE */}
+      <Card>
+        <CardHead>Timeline</CardHead>
+        <div style={F.timeline}>
+          <TBlock icon="🥄" label="Feed" time={fmtDisplay(result.feedStr, tz)} sub="start clock" />
+          <div style={F.tBar} />
+          <TBlock icon="⬆" label="Use at peak" time={fmtDisplay(result.peakStr, tz)} sub="mix dough now" gold />
+          <div style={F.tBar} />
+          <TBlock icon="⚠" label="Falling by" time={fmtDisplay(addHoursToStr(result.peakStr, 1.0), tz)} sub="don't wait" warn />
+        </div>
+        <div style={{fontSize:13, color:C.muted, lineHeight:1.6, marginTop:12, paddingTop:10, borderTop:`1px solid ${C.border}`}}>
+          Mix your dough <strong style={{color:C.white}}>at peak</strong> — domed top, full of bubbles, jiggles when shaken. The ⚠ time is when it starts collapsing and losing strength.
+        </div>
+      </Card>
+
+      {/* MAIN TILES */}
+      <div style={F.tiles}>
+        <Tile label="Feeding ratio" big={fmtRatio(result.ratio)} sub="starter : flour : water" />
+        <Tile label="Est. peak" big={fmtH(result.peak)} sub={`at ${tempC}°C`} highlight />
+      </div>
+
+      {/* JAR WARNING */}
+      {result.jarWarning === "not-enough" && (
+        <div style={{background:"#2A0E0A",border:`1px solid ${C.red}55`,borderRadius:12,padding:"14px 16px",marginBottom:12}}>
+          <div style={{color:C.red,fontWeight:700,fontSize:14,marginBottom:4}}>⚠ Not enough starter</div>
+          <div style={{color:C.muted,fontSize:13,lineHeight:1.6}}>
+            You have {result.jarG}g in the jar but need at least {(result.feed.reserve||50)+10}g to keep {result.feed.reserve}g back and still have enough starter to feed. Feed what you have, then feed again before your bake.
+          </div>
+        </div>
+      )}
+      {result.jarWarning === "constrained" && (
+        <div style={{background:"#1E1A0A",border:`1px solid ${C.gold}44`,borderRadius:12,padding:"14px 16px",marginBottom:12}}>
+          <div style={{color:C.gold,fontWeight:700,fontSize:14,marginBottom:4}}>↓ Feed adjusted for your jar</div>
+          <div style={{color:C.muted,fontSize:13,lineHeight:1.6}}>
+            Ideal starter was {result.seedNeeded}g but you only have {result.jarG}g — {result.shortfall}g short. Feed amounts scaled down to use {result.availSeed}g starter. Levain output will be slightly less than ideal. Consider a double feed if you need the full amount.
+          </div>
+        </div>
+      )}
+      {result.jarG && !result.jarWarning && (
+        <div style={{background:"#0A1E0F",border:`1px solid ${C.green}44`,borderRadius:12,padding:"12px 16px",marginBottom:12,display:"flex",alignItems:"center",gap:10}}>
+          <span style={{fontSize:18}}>✓</span>
+          <div style={{color:C.green,fontSize:13,fontWeight:600}}>You have enough — {result.jarG}g in jar, {result.feed.seed}g needed as starter</div>
+        </div>
+      )}
+
+      {/* FEED AMOUNTS */}
+      <Card>
+        <CardHead>What goes in the jar <Bdg>{result.feed.total}g total</Bdg></CardHead>
+        <div style={F.pillRow}>
+          <BigPill label="Starter" g={result.feed.seed} color={C.gold} />
+          <PlusSign />
+          {boostFlour!=="none" ? (<>
+            <BigPill label={BASE_FLOUR[baseFlour]?.label.split("/")[0].trim()} g={Math.round(result.feed.flour*(1-boostPct/100))} color={C.tan} />
+            <PlusSign />
+            <BigPill label={BOOST_FLOURS.find(f=>f.id===boostFlour)?.label.split(" ")[0]} g={Math.round(result.feed.flour*boostPct/100)} color="#B8956A" />
+          </>) : (
+            <BigPill label="Flour" g={result.feed.flour} color={C.tan} />
+          )}
+          <PlusSign />
+          <BigPill label="Water" g={result.feed.water} color={C.blue} />
+        </div>
+        <div style={F.divider} />
+        <div style={F.outRow}>
+          <div style={F.outBlock}>
+            <div style={F.outLabel}>Into dough</div>
+            <div style={F.outVal}>{result.feed.levain}g</div>
+            <div style={F.outSub}>{result.bPct}% levain</div>
+          </div>
+          <div style={F.outArrow}>→</div>
+          <div style={F.outBlock}>
+            <div style={F.outLabel}>Back in jar</div>
+            <div style={F.outVal}>{result.feed.reserve}g</div>
+            <div style={F.outSub}>your next starter</div>
+          </div>
+        </div>
+      </Card>
+
+      {/* TIMER */}
+      <StarterTimer peakHours={result.peak} starterName={starterName} notifPermission={notifPermission} onEnableNotif={onEnableNotif} />
+
+      {/* FEEDBACK */}
+      {!feedbackDone ? (
+        <Card>
+          <CardHead>Was this accurate?</CardHead>
+          <div style={F.fbNote}>After your starter peaks, tap below to help calibrate future estimates.</div>
+          <div style={F.fbRow}>
+            <FbBtn icon="⚡" label="Peaked early" color={C.green}
+              onClick={()=>{ onFeedback(result,"early"); setFeedbackDone(true); }} />
+            <FbBtn icon="✓" label="Spot on" color={C.gold}
+              onClick={()=>{ onFeedback(result,"spot-on"); setFeedbackDone(true); }} />
+            <FbBtn icon="🐢" label="Peaked late" color={C.red}
+              onClick={()=>{ onFeedback(result,"late"); setFeedbackDone(true); }} />
+          </div>
+        </Card>
+      ) : (
+        <Card>
+          <div style={{textAlign:"center",padding:"8px 0"}}>
+            <div style={{fontSize:22,marginBottom:6}}>✓</div>
+            <div style={{color:C.white,fontSize:15,fontWeight:600}}>Feedback saved</div>
+            <div style={{color:C.muted,fontSize:13,marginTop:4}}>Future estimates adjusted for your starter</div>
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+// ─── TAB 2: FEED SCHEDULER ───────────────────────────────────────────────────
+function FeedScheduler({ bias, onFeedback, tz, nowStr, starterName, notifPermission, onEnableNotif }) {
+  const [tempC, setTempC]     = useState(22);
+  const [feedTime, setFeedTime] = useState(()=>nowStr||"08:00");
+  const [ratioPreset, setRatioPreset] = useState(2);
+  const [customRatioStr, setCustomRatioStr] = useState("1:3:3");
+  const [baseFlour, setBaseFlour] = useState("ap");
+  const [boostFlour, setBoostFlour] = useState("none");
+  const [boostPct, setBoostPct] = useState(10);
+  const [result, setResult]   = useState(null);
+  const [feedbackDone, setFeedbackDone] = useState(false);
+
+  function calculate() {
+    const ratio = ratioPreset==="custom" ? parseRatioStr(customRatioStr) : ratioPreset;
+    if (!ratio) return;
+    const fm = flourMult(baseFlour, boostFlour, boostFlour==="none"?0:boostPct);
+    const peak = peakHours(ratio, tempC, fm, bias);
+    const peakStr24  = addHoursToStr(feedTime, peak);
+    const useByStr24 = addHoursToStr(feedTime, peak+1.0);
+    setResult({
+      ratio, peak, fm, bias, tempC,
+      feedStr: feedTime,
+      peakStr: peakStr24,
+      useByStr: useByStr24,
+      flourLabel: flourDesc(baseFlour, boostFlour, boostFlour==="none"?0:boostPct),
+    });
+    setFeedbackDone(false);
+  }
+
+  return (
+    <div>
+      <InfoBox>Enter when you plan to feed — get your peak window and use-by time.</InfoBox>
+
+      <SliderField label="Kitchen temperature" display={`${tempC}°C`}
+        min={14} max={34} step={0.5} value={tempC} onChange={setTempC}
+        hint={tempHint(tempC)} lo="14°C" hi="34°C" />
+
+      <Spacer />
+
+      <div style={F.field}>
+        <Label>Feed time</Label>
+        <input type="time" style={{...F.sel, colorScheme:"dark", fontSize:18, fontWeight:600}}
+          value={feedTime} onChange={e=>setFeedTime(e.target.value)} />
+        <Hint>Now is {fmtDisplay(nowStr, tz)}</Hint>
+      </div>
+
+      <div style={F.field}>
+        <Label>Feeding ratio</Label>
+        <Select value={ratioPreset} onChange={v=>setRatioPreset(v==="custom"?"custom":parseFloat(v))}>
+          {RATIO_PRESETS.map((r,i)=><option key={i} value={r.value}>{r.label}</option>)}
+        </Select>
+        {ratioPreset==="custom" && (
+          <TextInput value={customRatioStr} onChange={setCustomRatioStr} placeholder="e.g. 1:3:2" />
+        )}
+      </div>
+
+      <Spacer />
+      <SectionHead>Flour blend</SectionHead>
+
+      <div style={F.field}>
+        <Label>Base flour</Label>
+        <Select value={baseFlour} onChange={v=>{setBaseFlour(v);setResult(null);}}>
+          {Object.entries(BASE_FLOUR).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}
+        </Select>
+      </div>
+      <div style={F.field}>
+        <Label>Boost flour <span style={{color:C.subtle,fontWeight:"normal",textTransform:"none",fontSize:12}}>(optional)</span></Label>
+        <Select value={boostFlour} onChange={v=>{setBoostFlour(v);setResult(null);}}>
+          {BOOST_FLOURS.map(f=><option key={f.id} value={f.id}>{f.label}</option>)}
+        </Select>
+        {boostFlour!=="none" && (
+          <SliderField label="Amount" display={`${boostPct}%`}
+            min={5} max={50} step={5} value={boostPct} onChange={v=>{setBoostPct(v);setResult(null);}}
+            hint={boostHint(boostPct)} lo="5%" hi="50%" />
+        )}
+      </div>
+
+      <button style={F.goBtn} className="goBtn" onClick={calculate}>Show my window</button>
+
+      {result && (
+        <div style={F.results} className="fadeIn">
+          <SectionHead>Feed timeline</SectionHead>
+          {result.flourLabel && (
+            <div style={F.flourTag}>
+              <span style={{color:C.gold}}>🌾</span>
+              <span style={{color:C.white,fontWeight:600}}>{result.flourLabel}</span>
+            </div>
+          )}
+          <div style={F.timeline}>
+            <TBlock icon="🥄" label="Feed" time={fmtDisplay(result.feedStr, tz)} sub="start clock" />
+            <div style={F.tBar} />
+            <TBlock icon="⬆" label="Use at peak" time={fmtDisplay(result.peakStr, tz)} sub={`mix dough now`} gold />
+            <div style={F.tBar} />
+            <TBlock icon="⚠" label="Falling by" time={fmtDisplay(result.useByStr, tz)} sub="don't wait" warn />
+          </div>
+          <InfoBox>Use your starter <strong style={{color:C.white}}>at peak</strong> — that's when it has maximum strength. The ⚠ time is when it starts to collapse and lose leavening power. Don't wait until then.</InfoBox>
+
+          <StarterTimer peakHours={result.peak} starterName={starterName} notifPermission={notifPermission} onEnableNotif={onEnableNotif} />
+
+          {!feedbackDone ? (
+            <Card>
+              <CardHead>Was this accurate?</CardHead>
+              <div style={F.fbNote}>After your starter peaks, tap to calibrate future estimates.</div>
+              <div style={F.fbRow}>
+                <FbBtn icon="⚡" label="Early" color={C.green} onClick={()=>{ onFeedback(result,"early"); setFeedbackDone(true); }} />
+                <FbBtn icon="✓" label="Spot on" color={C.gold} onClick={()=>{ onFeedback(result,"spot-on"); setFeedbackDone(true); }} />
+                <FbBtn icon="🐢" label="Late" color={C.red} onClick={()=>{ onFeedback(result,"late"); setFeedbackDone(true); }} />
+              </div>
+            </Card>
+          ) : (
+            <Card><div style={{textAlign:"center",padding:"6px 0",color:C.muted,fontSize:13}}>✓ Feedback saved — model updated</div></Card>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── TAB 3: HYDRATION ────────────────────────────────────────────────────────
+function HydrationCalc() {
+  const [flour, setFlour]             = useState(500);
+  const [water, setWater]             = useState(350);
+  const [starterG, setStarterG]       = useState(75);
+  const [starterHyd, setStarterHyd]   = useState(100);
+  const [salt, setSalt]               = useState(10);
+
+  const sFlour = Math.round(starterG/(1+starterHyd/100));
+  const sWater = starterG - sFlour;
+  const tFlour = flour+sFlour, tWater = water+sWater;
+  const hyd = Math.round((tWater/tFlour)*100);
+  const saltPct = ((salt/flour)*100).toFixed(1);
+
+  const fields = [
+    {label:"Flour (g)",           val:flour,      set:setFlour,     min:100, max:2000},
+    {label:"Water (g)",           val:water,      set:setWater,     min:50,  max:2000},
+    {label:"Starter / levain (g)",val:starterG,   set:setStarterG,  min:0,   max:500},
+    {label:"Starter hydration (%)",val:starterHyd, set:setStarterHyd,min:50, max:150},
+    {label:"Salt (g)",            val:salt,        set:setSalt,      min:0,   max:40},
+  ];
+
+  return (
+    <div>
+      <InfoBox>True hydration includes water locked inside your starter — not just what you add to the dough.</InfoBox>
+      <Spacer />
+      {fields.map(({label,val,set,min,max})=>(
+        <SliderField key={label} label={label}
+          display={`${val}${label.includes("%")?"%" :"g"}`}
+          min={min} max={max} step={label.includes("%")?5:5}
+          value={val} onChange={set} lo={`${min}`} hi={`${max}`} />
+      ))}
+      <Spacer />
+      <Card>
+        <HydRow label="Total flour" val={`${tFlour}g`} />
+        <HydRow label="Total water" val={`${tWater}g`} />
+        <div style={F.divider} />
+        <HydRow label="True hydration" val={`${hyd}%`} big gold />
+        <HydRow label="Salt (baker's %)" val={`${saltPct}%`} />
+        <HydRow label="Total dough" val={`${tFlour+tWater+salt}g`} />
+        <Spacer small />
+        <InfoBox>
+          {hyd<65?"Low hydration — tight crumb, easy to handle."
+           :hyd<72?"Standard — reliable all-rounder."
+           :hyd<78?"Higher hydration — open crumb, needs technique."
+           :"Very high — challenging to shape, very open crumb."}
+        </InfoBox>
+      </Card>
+    </div>
+  );
+}
+
+// ─── TAB 4: BAKE GUIDE ───────────────────────────────────────────────────────
+
+// ── Bake model data ──────────────────────────────────────────────────────────
+// All temperatures in °C. Times in minutes.
+// Sources: The Sourdough Journey, King Arthur, Grant Bakes, Amy Bakes Bread,
+//          The Week, Sourdough Symphony (enriched temps), Pantry Mama (tin loaf)
+
+const BAKE_VESSELS = [
+  { id:"dutch",    label:"Dutch oven",          icon:"🫕" },
+  { id:"tin",      label:"Sandwich / loaf tin", icon:"🍞" },
+  { id:"open",     label:"Open bake (stone/steel)", icon:"🪨" },
+];
+
+const LOAF_SHAPES = [
+  { id:"boule",   label:"Boule (round)",   icon:"⚪" },
+  { id:"batard",  label:"Batard (oval)",   icon:"🏈" },
+  { id:"sandwich",label:"Sandwich loaf",  icon:"🍞" },
+];
+
+// Grouped inclusions — each item has id, label, tempAdj (°C), timeAdj (mins), note
+const INCLUSION_GROUPS = [
+  {
+    group: "None",
+    items: [
+      { id:"none", label:"None — plain dough", tempAdj:0, timeAdj:0, note:null },
+    ]
+  },
+  {
+    group: "Nuts & Seeds",
+    items: [
+      { id:"nuts",    label:"Nuts — walnuts, pecans, hazelnuts", tempAdj:-5, timeAdj:3,  note:"Toast nuts first — intensifies flavour and prevents mealy texture. Nuts absorb moisture so dough may feel stiffer." },
+      { id:"seeds",   label:"Seeds — sesame, sunflower, poppy",  tempAdj:0,  timeAdj:2,  note:"Soak seeds in equal weight of water overnight before adding. Unsoaked seeds can be hard in the final crumb." },
+    ]
+  },
+  {
+    group: "Fruit",
+    items: [
+      { id:"fruit",   label:"Dried fruit — raisins, cranberries, apricot", tempAdj:-10, timeAdj:5, note:"Sugar in dried fruit browns fast — watch crust from 15 min into the uncovered phase. Soak fruit first to control hydration." },
+    ]
+  },
+  {
+    group: "Savoury — Alliums & Spice",
+    items: [
+      { id:"onion",     label:"Caramelised or roasted onion",  tempAdj:-10, timeAdj:4,  note:"Caramelised onion adds sugar — crust browns faster than a plain loaf. Roast or caramelise before adding; raw onion disrupts fermentation." },
+      { id:"jalapeno",  label:"Jalapeños (fresh or pickled)",  tempAdj:-5,  timeAdj:2,  note:"Pickled jalapeños add acidity and moisture — pat dry before folding in. Fresh jalapeños are milder on the dough but can slow fermentation slightly." },
+      { id:"garlic",    label:"Roasted garlic / fresh herbs",  tempAdj:0,   timeAdj:0,  note:"Roast garlic before adding — raw garlic can inhibit fermentation. Garlic on top of the loaf burns easily; add halfway through the uncovered phase." },
+    ]
+  },
+  {
+    group: "Savoury — Cheese & Oil-Cured",
+    items: [
+      { id:"cheese",  label:"Cheese — cheddar, gruyère, parmesan", tempAdj:-5, timeAdj:3, note:"Fat from cheese can cause burning on top — check at 20 min and tent with foil if darkening too fast." },
+      { id:"olives",  label:"Olives / sun-dried tomatoes",          tempAdj:-5, timeAdj:3, note:"Oil-cured inclusions add fat to the dough — reduce hydration by a few percent. Drain and pat dry before adding." },
+    ]
+  },
+  {
+    group: "Sweet",
+    items: [
+      { id:"chocolate", label:"Chocolate chips / chopped chocolate", tempAdj:-15, timeAdj:5, note:"Chocolate burns very easily. Use the lower end of the temperature range and don't walk away. Dark chocolate (70%+) is most stable." },
+    ]
+  },
+];
+
+// Flat list for lookups
+const INCLUSION_OPTIONS = INCLUSION_GROUPS.flatMap(g => g.items);
+
+// Base bake plans (lean, standard hydration ~70%, 500g flour, no inclusions)
+function getBakePlan(vessel, doughType, loafSizeG, inclusions, convection) {
+  const isEnriched = doughType === "enriched";
+  const isTin = vessel === "tin";
+  const isOpen = vessel === "open";
+  const isDutch = vessel === "dutch";
+
+  // Base temperatures
+  let preheatC, phase1C, phase2C;
+  if (isEnriched) {
+    preheatC = 180; phase1C = 175; phase2C = 170;
+  } else if (isTin) {
+    preheatC = 230; phase1C = 220; phase2C = 200;
+  } else if (isOpen) {
+    preheatC = 250; phase1C = 230; phase2C = 220;
+  } else { // dutch
+    preheatC = 260; phase1C = 230; phase2C = 230;
+  }
+
+  // Convection drops temp ~15°C (open/tin only — Dutch oven unaffected until lid off)
+  const convAdj = convection && !isDutch ? -15 : 0;
+
+  // Size adjustment — larger loaves need more time
+  let sizeTimeAdj = 0;
+  if (loafSizeG < 700) sizeTimeAdj = -5;
+  else if (loafSizeG > 1000) sizeTimeAdj = 8;
+  else if (loafSizeG > 800) sizeTimeAdj = 4;
+
+  // Inclusion adjustments — stack all selected
+  let incTempAdj = 0, incTimeAdj = 0;
+  const incNotes = [];
+  inclusions.forEach(id => {
+    const inc = INCLUSION_OPTIONS.find(o => o.id === id);
+    if (inc && inc.id !== "none") {
+      incTempAdj += inc.tempAdj;
+      incTimeAdj += inc.timeAdj;
+      if (inc.note) incNotes.push(inc.note);
+    }
+  });
+
+  // Cap inclusion temp reduction at -20°C to avoid going too low
+  incTempAdj = Math.max(incTempAdj, -20);
+
+  // Final temps
+  const fp1 = phase1C + convAdj + incTempAdj;
+  const fp2 = phase2C + convAdj + incTempAdj;
+  const fpreheat = preheatC + (convection && !isDutch ? -15 : 0);
+
+  // Times
+  const internalTarget = isEnriched ? 88 : 98;
+
+  if (isDutch) {
+    const coveredMins = 20 + Math.round(sizeTimeAdj * 0.4) + Math.round(incTimeAdj * 0.3);
+    const uncoveredMins = 20 + sizeTimeAdj + incTimeAdj;
+    return {
+      vessel, doughType, loafSizeG, convection,
+      preheatC: fpreheat,
+      phases: [
+        { label:"Preheat Dutch oven", temp:fpreheat, mins:null, detail:"With lid off. Continue 10–15 min after oven reaches temp for best results." },
+        { label:"Load & cover", temp:fp1, mins:`${coveredMins}`, detail:"Reduce heat when loading. Lid traps steam — don't open early." },
+        { label:"Remove lid", temp:fp2, mins:`${uncoveredMins}`, detail:`Bake uncovered until deep golden brown. Check at ${uncoveredMins - 5} min.` },
+      ],
+      totalMins: coveredMins + uncoveredMins,
+      internalTarget,
+      steamNote: "Steam is created naturally inside the Dutch oven — no steam tray needed.",
+      fanNote: "Fan/convection not needed — Dutch oven handles heat distribution until lid comes off.",
+      incNotes,
+    };
+  }
+
+  if (isTin) {
+    const steamMins = 25 + Math.round(sizeTimeAdj * 0.5);
+    const uncoveredMins = 15 + Math.round(sizeTimeAdj * 0.5) + incTimeAdj;
+    return {
+      vessel, doughType, loafSizeG, convection,
+      preheatC: fpreheat,
+      phases: [
+        { label:"Preheat oven", temp:fpreheat, mins:null, detail:"Place a pan of water on the bottom rack before loading." },
+        { label:"Bake with steam", temp:fp1, mins:`${steamMins}`, detail:isEnriched ? "Enriched dough doesn't need steam — skip the water pan." : "Water pan on bottom rack provides steam for oven spring." },
+        { label:"Remove steam, bake on", temp:fp2, mins:`${uncoveredMins}`, detail:`Remove water pan. Continue until golden on top. Check at ${uncoveredMins - 5} min.` },
+      ],
+      totalMins: steamMins + uncoveredMins,
+      internalTarget,
+      steamNote: isEnriched
+        ? "Enriched doughs don't benefit from steam — skip the water pan entirely."
+        : "Add a pan of boiling water to the bottom rack. Remove after the steam phase.",
+      fanNote: isTin
+        ? "Fan off recommended for sandwich loaves — keeps crust soft and prevents over-drying the top."
+        : "Fan can help even browning for open bakes but check your loaf earlier.",
+      incNotes,
+      tinTip: "Optional: place a second tin of the same size on top to trap steam like a mini Dutch oven.",
+    };
+  }
+
+  // Open bake
+  const steamMins = 20 + Math.round(sizeTimeAdj * 0.4);
+  const uncoveredMins = 20 + sizeTimeAdj + incTimeAdj;
+  return {
+    vessel, doughType, loafSizeG, convection,
+    preheatC: fpreheat,
+    phases: [
+      { label:"Preheat stone/steel", temp:fpreheat, mins:null, detail:"At least 45–60 min for full saturation. Don't rush the preheat." },
+      { label:"Bake with steam", temp:fp1, mins:`${steamMins}`, detail:"Steam tray or ice cubes on bottom rack. Score and load quickly." },
+      { label:"Remove steam, bake on", temp:fp2, mins:`${uncoveredMins}`, detail:`Remove steam source. Bake until deep golden. Check at ${uncoveredMins - 5} min.` },
+    ],
+    totalMins: steamMins + uncoveredMins,
+    internalTarget,
+    steamNote: "Steam must be added — tray of boiling water or ice cubes on bottom rack. Remove after steam phase.",
+    fanNote: "Fan/convection can help even browning on open bakes. Lower temp by 15°C if using fan.",
+    incNotes,
+  };
+}
+
+function BakeGuide() {
+  const [vessel, setVessel] = useState("dutch");
+  const [doughType, setDoughType] = useState("lean");
+  const [loafSizeG, setLoafSizeG] = useState(900);
+  const [inclusions, setInclusions] = useState(["none"]);
+  const [convection, setConvection] = useState(false);
+  const [plan, setPlan] = useState(null);
+
+  function toggleInclusion(id) {
+    if (id === "none") {
+      setInclusions(["none"]);
+      return;
+    }
+    setInclusions(prev => {
+      const without = prev.filter(i => i !== "none");
+      if (without.includes(id)) {
+        const next = without.filter(i => i !== id);
+        return next.length === 0 ? ["none"] : next;
+      }
+      return [...without, id];
+    });
+  }
+
+  function generate() {
+    const p = getBakePlan(vessel, doughType, loafSizeG, inclusions, convection);
+    setPlan(p);
+  }
+
+  const activeInclusions = inclusions.filter(i => i !== "none");
+
+  return (
+    <div>
+      <InfoBox>
+        Bake times and temperatures based on your setup. All ovens differ —
+        use <strong style={{color:C.white}}>crust colour and internal temperature</strong> as your real finish line, not the timer alone.
+      </InfoBox>
+
+      {/* VESSEL */}
+      <SectionHead>Bake vessel</SectionHead>
+      <div style={{display:"flex",gap:8,marginBottom:20,flexWrap:"wrap"}}>
+        {BAKE_VESSELS.map(v=>(
+          <button key={v.id} onClick={()=>{setVessel(v.id);setPlan(null);}}
+            style={{flex:1,minWidth:90,padding:"12px 8px",
+              background:vessel===v.id?C.elevated:C.bg,
+              border:`1.5px solid ${vessel===v.id?C.gold+"66":C.border}`,
+              borderRadius:10,color:vessel===v.id?C.white:C.muted,
+              cursor:"pointer",fontFamily:"inherit",textAlign:"center"}}>
+            <div style={{fontSize:22,marginBottom:4}}>{v.icon}</div>
+            <div style={{fontSize:12,fontWeight:vessel===v.id?600:400,lineHeight:1.3}}>{v.label}</div>
+          </button>
+        ))}
+      </div>
+
+      {/* DOUGH TYPE */}
+      <SectionHead>Dough type</SectionHead>
+      <Toggle
+        options={[
+          {id:"lean", label:"Lean (flour, water, salt, starter)"},
+          {id:"enriched", label:"Enriched (butter, eggs, milk…)"},
+        ]}
+        value={doughType} onChange={v=>{setDoughType(v);setPlan(null);}} />
+      {doughType==="enriched" && (
+        <div style={{marginTop:8}}>
+          <Hint>Enriched doughs bake at lower temps (165–185°C), don't need steam, and target 88°C internal. Sugar burns — watch the crust carefully.</Hint>
+        </div>
+      )}
+
+      <Spacer />
+
+      {/* LOAF SIZE */}
+      <SectionHead>Loaf size</SectionHead>
+      <div style={F.field}>
+        <Label>Quick select</Label>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:12}}>
+          {[
+            {label:"Small",     sub:"~600g",  g:600},
+            {label:"Standard",  sub:"~900g",  g:900},
+            {label:"Large",     sub:"~1100g", g:1100},
+            {label:"Jumbo",     sub:"~1300g", g:1300},
+          ].map(s=>(
+            <button key={s.g} onClick={()=>{setLoafSizeG(s.g);setPlan(null);}}
+              style={{flex:1,padding:"10px 6px",textAlign:"center",
+                background:loafSizeG===s.g?C.elevated:C.bg,
+                border:`1.5px solid ${loafSizeG===s.g?C.gold+"66":C.border}`,
+                borderRadius:10,color:loafSizeG===s.g?C.white:C.muted,
+                cursor:"pointer",fontFamily:"inherit"}}>
+              <div style={{fontSize:13,fontWeight:loafSizeG===s.g?700:400}}>{s.label}</div>
+              <div style={{fontSize:11,color:C.subtle,marginTop:2}}>{s.sub}</div>
+            </button>
+          ))}
+        </div>
+        <Label>Or enter exact dough weight (g)</Label>
+        <input type="number" style={{...F.sel, fontSize:18, fontWeight:600}}
+          value={loafSizeG} min={300} max={2000}
+          onChange={e=>{setLoafSizeG(Math.max(300,+e.target.value));setPlan(null);}}
+          placeholder="e.g. 950" />
+        <Hint>
+          {loafSizeG < 600 ? "Small — shorter bake, check earlier" :
+           loafSizeG < 800 ? "Standard small — typical home loaf" :
+           loafSizeG < 1000 ? "Standard — most home recipes" :
+           loafSizeG < 1200 ? "Large — needs extra time" :
+           "Jumbo — allow significantly longer"}
+          {" · Don't weigh? Use the quick select above — most home loaves are Standard."}
+        </Hint>
+      </div>
+
+      <Spacer />
+
+      {/* INCLUSIONS */}
+      <SectionHead>
+        Inclusions
+        {activeInclusions.length > 0 && (
+          <span style={{color:C.gold,fontWeight:700,marginLeft:6}}>{activeInclusions.length} selected</span>
+        )}
+      </SectionHead>
+
+      {/* None button always visible */}
+      <div style={{marginBottom: inclusions.includes("none") ? 20 : 12}}>
+        <button onClick={()=>{toggleInclusion("none");setPlan(null);}}
+          style={{width:"100%",padding:"11px 14px",textAlign:"left",
+            background:inclusions.includes("none")?C.elevated:C.bg,
+            border:`1.5px solid ${inclusions.includes("none")?C.gold+"66":C.border}`,
+            borderRadius:10,color:inclusions.includes("none")?C.white:C.muted,
+            cursor:"pointer",fontFamily:"inherit",fontSize:14,
+            display:"flex",alignItems:"center",gap:10}}>
+          <span style={{width:18,height:18,borderRadius:4,
+            background:inclusions.includes("none")?C.gold:"transparent",
+            border:`2px solid ${inclusions.includes("none")?C.gold:C.border}`,
+            display:"flex",alignItems:"center",justifyContent:"center",
+            flexShrink:0,fontSize:11,color:C.bg,fontWeight:700}}>
+            {inclusions.includes("none")?"✓":""}
+          </span>
+          None — plain dough
+        </button>
+      </div>
+
+      {/* Grouped inclusions — only show when not None */}
+      {!inclusions.includes("none") && (
+        <div style={{marginBottom:20}} className="fadeIn">
+          {INCLUSION_GROUPS.filter(g=>g.group!=="None").map(group=>(
+            <div key={group.group} style={{marginBottom:16}}>
+              <div style={{fontSize:10,letterSpacing:"0.12em",textTransform:"uppercase",
+                color:C.subtle,fontWeight:700,marginBottom:8,paddingLeft:2}}>
+                {group.group}
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                {group.items.map(inc=>(
+                  <button key={inc.id} onClick={()=>{toggleInclusion(inc.id);setPlan(null);}}
+                    style={{padding:"11px 14px",textAlign:"left",
+                      background:inclusions.includes(inc.id)?C.elevated:C.bg,
+                      border:`1.5px solid ${inclusions.includes(inc.id)?C.gold+"66":C.border}`,
+                      borderRadius:10,color:inclusions.includes(inc.id)?C.white:C.muted,
+                      cursor:"pointer",fontFamily:"inherit",fontSize:14,
+                      display:"flex",alignItems:"center",gap:10}}>
+                    <span style={{width:18,height:18,borderRadius:4,
+                      background:inclusions.includes(inc.id)?C.gold:"transparent",
+                      border:`2px solid ${inclusions.includes(inc.id)?C.gold:C.border}`,
+                      display:"flex",alignItems:"center",justifyContent:"center",
+                      flexShrink:0,fontSize:11,color:C.bg,fontWeight:700}}>
+                      {inclusions.includes(inc.id)?"✓":""}
+                    </span>
+                    {inc.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {activeInclusions.length > 1 && (
+        <div style={{background:"#1E1A0A",border:`1px solid ${C.gold}44`,borderRadius:10,
+          padding:"10px 14px",fontSize:13,color:C.muted,marginBottom:16,lineHeight:1.6}}>
+          <strong style={{color:C.gold}}>Multiple inclusions</strong> — effects stack.
+          {inclusions.includes("fruit") && inclusions.includes("chocolate") && " 🔥 Fruit + chocolate: both darken fast — watch very closely and tent with foil early."}
+          {inclusions.includes("fruit") && inclusions.includes("onion") && " 🔥 Fruit + onion: double sugar load — crust will brown significantly faster."}
+          {inclusions.includes("onion") && inclusions.includes("cheese") && " Onion + cheese: classic combo, both add fat/sugar — check top at 15 min."}
+          {inclusions.includes("jalapeno") && inclusions.includes("cheese") && " Jalapeño + cheese: great pairing, minimal interaction. Standard adjustment applies."}
+          {inclusions.includes("fruit") && inclusions.includes("nuts") && " Fruit + nuts: good balance — fruit speeds activity, nuts add moisture absorption."}
+          {" "}Temperature and time adjusted for the combination.
+        </div>
+      )}
+
+      {/* CONVECTION */}
+      <SectionHead>Oven setting</SectionHead>
+      <Toggle
+        options={[{id:"off",label:"Fan off (conventional)"},{id:"on",label:"Fan on (convection)"}]}
+        value={convection?"on":"off"}
+        onChange={v=>{setConvection(v==="on");setPlan(null);}} />
+      {vessel==="dutch" && convection && (
+        <Hint>Fan has no effect while the Dutch oven lid is on. It only matters after the lid comes off.</Hint>
+      )}
+      {vessel==="tin" && convection && (
+        <Hint>Fan not recommended for sandwich loaves — dries the crust and can make it too hard.</Hint>
+      )}
+
+      <Spacer />
+      <button style={F.goBtn} className="goBtn" onClick={generate}>Generate bake plan</button>
+
+      {/* RESULTS */}
+      {plan && (
+        <div style={F.results} className="fadeIn">
+          <SectionHead>Your bake plan</SectionHead>
+
+          {/* PHASE CARDS */}
+          {plan.phases.map((phase, i) => (
+            <div key={i} style={{background:C.surface,border:`1px solid ${i===1?C.gold+"44":C.border}`,
+              borderRadius:14,padding:"16px 14px",marginBottom:10}}>
+              <div style={{display:"flex",alignItems:"baseline",justifyContent:"space-between",marginBottom:8}}>
+                <div style={{fontSize:12,letterSpacing:"0.08em",textTransform:"uppercase",
+                  color:i===1?C.gold:C.muted,fontWeight:700}}>
+                  {`Step ${i+1} — ${phase.label}`}
+                </div>
+                {phase.mins && (
+                  <div style={{fontSize:22,color:C.white,fontWeight:700}}>{phase.mins} min</div>
+                )}
+              </div>
+              <div style={{fontSize:22,color:C.gold,fontWeight:700,marginBottom:6}}>
+                {phase.temp}°C
+                {convection&&vessel!=="dutch"&&<span style={{fontSize:13,color:C.muted,fontWeight:400,marginLeft:6}}>(fan on)</span>}
+              </div>
+              <div style={{fontSize:13,color:C.muted,lineHeight:1.6}}>{phase.detail}</div>
+            </div>
+          ))}
+
+          {/* SUMMARY TILES */}
+          <div style={F.tiles}>
+            <Tile label="Total bake time" big={`${plan.totalMins} min`} sub="approximate" highlight />
+            <Tile label="Internal temp" big={`${plan.internalTarget}°C`} sub="minimum target" />
+          </div>
+
+          {/* STEAM + FAN NOTES */}
+          <Card>
+            <CardHead>Setup notes</CardHead>
+            <div style={{fontSize:13,color:C.muted,lineHeight:1.7}}>
+              <div style={{marginBottom:8}}>
+                <span style={{color:C.white,fontWeight:600}}>Steam: </span>{plan.steamNote}
+              </div>
+              <div style={{marginBottom: plan.tinTip ? 8 : 0}}>
+                <span style={{color:C.white,fontWeight:600}}>Fan: </span>{plan.fanNote}
+              </div>
+              {plan.tinTip && (
+                <div style={{marginTop:4,background:C.elevated,borderRadius:8,padding:"8px 10px",fontSize:12,color:C.subtle}}>
+                  💡 {plan.tinTip}
+                </div>
+              )}
+            </div>
+          </Card>
+
+          {/* INCLUSION NOTES */}
+          {plan.incNotes.length > 0 && (
+            <Card>
+              <CardHead>Inclusion notes</CardHead>
+              <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                {plan.incNotes.map((note,i)=>(
+                  <div key={i} style={{fontSize:13,color:C.muted,lineHeight:1.6,
+                    paddingLeft:12,borderLeft:`2px solid ${C.gold}66`}}>
+                    {note}
+                  </div>
+                ))}
+              </div>
+            </Card>
+          )}
+
+          {/* DONENESS GUIDE */}
+          <Card>
+            <CardHead>How to know it's done</CardHead>
+            <div style={{fontSize:13,color:C.muted,lineHeight:1.8}}>
+              <div>🎨 <strong style={{color:C.white}}>Crust colour</strong> — deep golden brown, not pale. {plan.doughType==="enriched"?"Enriched doughs brown faster — golden is enough.":""}</div>
+              <div>🌡️ <strong style={{color:C.white}}>Internal temp</strong> — probe the centre: {plan.internalTarget}°C minimum</div>
+              <div>🔊 <strong style={{color:C.white}}>Hollow knock</strong> — tap the bottom, it should sound hollow</div>
+              <div>⏳ <strong style={{color:C.white}}>Cool completely</strong> — at least 1 hour before slicing. Crumb is still setting.</div>
+            </div>
+          </Card>
+
+          <InfoBox>
+            These are well-researched starting points, not guarantees. Your oven may run hot or cold.
+            Bake your first loaf using these as a guide, note the result, and adjust from there.
+          </InfoBox>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── TAB 5: HISTORY ──────────────────────────────────────────────────────────
+function HistoryTab({ history, bias, onReset }) {
+  const accurate = history.filter(h=>h.outcome==="spot-on").length;
+  const early    = history.filter(h=>h.outcome==="early").length;
+  const late     = history.filter(h=>h.outcome==="late").length;
+
+  return (
+    <div>
+      {history.length===0 ? (
+        <div style={{textAlign:"center",padding:"60px 20px"}}>
+          <div style={{fontSize:40,marginBottom:16}}>📋</div>
+          <div style={{color:C.white,fontSize:17,fontWeight:600,marginBottom:8}}>No history yet</div>
+          <div style={{color:C.muted,fontSize:14,lineHeight:1.6}}>After you calculate and give feedback, your bake history will appear here.</div>
+        </div>
+      ) : (
+        <>
+          {/* SUMMARY */}
+          <Card>
+            <CardHead>Model calibration</CardHead>
+            <div style={F.tiles}>
+              <Tile label="Current bias" big={bias<1?`${Math.round((1-bias)*100)}% faster`:bias>1?`${Math.round((bias-1)*100)}% slower`:"Baseline"} sub={bias<1?"starter runs fast":bias>1?"starter runs slow":"no adjustment"} highlight={bias!==1} />
+              <Tile label="Bakes logged" big={`${history.length}`} sub={`${accurate} spot-on · ${early} early · ${late} late`} />
+            </div>
+            <button style={{...F.goBtn,background:C.elevated,color:C.muted,marginTop:8}} onClick={onReset}>
+              Reset model &amp; history
+            </button>
+          </Card>
+
+          <Spacer />
+          <SectionHead>Bake log</SectionHead>
+
+          {history.map((h,i)=>(
+            <Card key={i}>
+              <div style={F.histRow}>
+                <div style={{...F.histIcon, background: h.outcome==="spot-on"?C.gold+"22":h.outcome==="early"?C.green+"22":C.red+"22"}}>
+                  {h.outcome==="spot-on"?"✓":h.outcome==="early"?"⚡":"🐢"}
+                </div>
+                <div style={{flex:1}}>
+                  <div style={{color:C.white,fontSize:15,fontWeight:600,marginBottom:2}}>
+                    {h.outcome==="spot-on"?"Spot on":h.outcome==="early"?"Peaked early":"Peaked late"}
+                  </div>
+                  <div style={{color:C.muted,fontSize:12}}>{h.date}</div>
+                </div>
+                <div style={{textAlign:"right"}}>
+                  <div style={{color:C.gold,fontSize:14,fontWeight:600}}>{fmtH(h.peak)}</div>
+                  <div style={{color:C.subtle,fontSize:11}}>{h.flourLabel||"—"}</div>
+                </div>
+              </div>
+              <div style={{display:"flex",gap:12,marginTop:8,flexWrap:"wrap"}}>
+                <HistPill label="Ratio" val={fmtRatio(h.ratio)} />
+                <HistPill label="Temp" val={`${h.tempC||"?"}°C`} />
+                <HistPill label="Bias after" val={h.biasAfter?.toFixed(2)||"1.00"} />
+              </div>
+            </Card>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── TIMER ───────────────────────────────────────────────────────────────────
+function StarterTimer({ peakHours: ph, starterName="your starter", notifPermission, onEnableNotif }) {
+  const total = Math.max(Math.round((ph-0.4)*3600), 60);
+  const [secs, setSecs]     = useState(total);
+  const [running, setRunning] = useState(false);
+  const [started, setStarted] = useState(false);
+  const [done, setDone]     = useState(false);
+  const [notifScheduled, setNotifScheduled] = useState(false);
+  const ref = useRef(null);
+  const notifRef = useRef(null);
+
+  useEffect(()=>{
+    clearInterval(ref.current);
+    cancelNotification(notifRef.current);
+    setSecs(Math.max(Math.round((ph-0.4)*3600),60));
+    setRunning(false); setStarted(false); setDone(false); setNotifScheduled(false);
+  },[ph]);
+
+  useEffect(()=>{
+    if (running) {
+      ref.current = setInterval(()=>{
+        setSecs(s=>{ if(s<=1){clearInterval(ref.current);setRunning(false);setDone(true);return 0;} return s-1; });
+      },1000);
+    } else clearInterval(ref.current);
+    return ()=>clearInterval(ref.current);
+  },[running]);
+
+  function startTimer() {
+    setRunning(true); setStarted(true); setDone(false);
+    // Schedule notification at timer completion
+    if (notifPermission==="granted") {
+      cancelNotification(notifRef.current);
+      const delayMs = Math.max(Math.round((ph-0.4)*3600), 60) * 1000;
+      notifRef.current = scheduleNotification(
+        `Time to check ${starterName}! 🍞`,
+        `Earliest peak reached — look for the dome and bubbles. Use it now for maximum strength.`,
+        delayMs
+      );
+      setNotifScheduled(true);
+    }
+  }
+
+  function resetTimer() {
+    clearInterval(ref.current);
+    cancelNotification(notifRef.current);
+    setSecs(total); setRunning(false); setStarted(false); setDone(false); setNotifScheduled(false);
+  }
+
+  const hrs=Math.floor(secs/3600), mins=Math.floor((secs%3600)/60), sec=secs%60;
+  const pad=n=>String(n).padStart(2,"0");
+  const prog=1-secs/total;
+  const Rv=54, circ=2*Math.PI*Rv, dash=circ*prog;
+
+  return (
+    <Card>
+      <CardHead>⏱ Starter timer <span style={{color:C.subtle,fontSize:11,fontWeight:"normal",textTransform:"none",letterSpacing:0}}>earliest peak</span></CardHead>
+      <div style={{position:"relative",width:152,height:152,margin:"0 auto 16px"}}>
+        <svg width="152" height="152" style={{position:"absolute",top:0,left:0}}>
+          <circle cx="76" cy="76" r={Rv} fill="none" stroke={C.elevated} strokeWidth="6"/>
+          <circle cx="76" cy="76" r={Rv} fill="none"
+            stroke={done?C.green:C.gold} strokeWidth="6"
+            strokeDasharray={`${dash} ${circ}`}
+            strokeLinecap="round"
+            style={{transform:"rotate(-90deg)",transformOrigin:"76px 76px",transition:"stroke-dasharray 0.8s linear"}}
+          />
+        </svg>
+        <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center"}}>
+          {done
+            ? <div style={{textAlign:"center",color:C.green,fontSize:13,lineHeight:1.4,fontWeight:600}}>Peak time —<br/>mix now!</div>
+            : <div style={{fontSize:26,color:C.white,fontVariantNumeric:"tabular-nums",letterSpacing:"0.02em"}}>
+                {hrs>0?`${hrs}:${pad(mins)}:${pad(sec)}`:`${pad(mins)}:${pad(sec)}`}
+              </div>
+          }
+        </div>
+      </div>
+      <div style={{display:"flex",gap:10,justifyContent:"center"}}>
+        {!started||done ? (
+          <button style={F.timerBtn} className="goBtn" onClick={startTimer}>
+            {done?"Start again":"Start timer"}
+          </button>
+        ) : (<>
+          <button style={{...F.timerBtn,background:running?C.elevated:"#c8a060",color:running?C.white:C.bg}}
+            onClick={()=>setRunning(r=>!r)}>{running?"Pause":"Resume"}</button>
+          <button style={{...F.timerBtn,background:"transparent",color:C.muted,border:`1px solid ${C.border}`}}
+            onClick={resetTimer}>Reset</button>
+        </>)}
+      </div>
+
+      {/* Notification status */}
+      {started && !done && (
+        <div style={{textAlign:"center",marginTop:10}}>
+          {notifScheduled
+            ? <div style={{fontSize:12,color:C.green}}>🔔 Notification set — you'll be alerted at peak</div>
+            : notifPermission==="granted"
+              ? null
+              : <button onClick={onEnableNotif}
+                  style={{fontSize:12,color:C.goldDim,background:"transparent",border:"none",
+                    cursor:"pointer",fontFamily:"inherit",textDecoration:"underline"}}>
+                  Enable notifications to be alerted at peak
+                </button>
+          }
+          <div style={{fontSize:12,color:C.subtle,marginTop:4,fontStyle:"italic"}}>Watch for the dome — not just the clock</div>
+        </div>
+      )}
+      {done && <div style={{textAlign:"center",color:C.green,fontSize:13,marginTop:10,fontWeight:600}}>Earliest peak reached — use it now if it's domed and bubbly</div>}
+    </Card>
+  );
+}
+
+// ─── SMALL COMPONENTS ────────────────────────────────────────────────────────
+function AdvancedToggle({ label, defaultNote, children }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{marginBottom:20}}>
+      <button onClick={()=>setOpen(o=>!o)} style={{
+        width:"100%", background:"transparent", border:`1px solid ${C.border}`,
+        borderRadius:10, padding:"11px 14px", display:"flex", alignItems:"center",
+        justifyContent:"space-between", cursor:"pointer", fontFamily:"inherit"
+      }}>
+        <span style={{fontSize:12,letterSpacing:"0.1em",textTransform:"uppercase",color:C.muted,fontWeight:600}}>
+          Advanced — {label}
+        </span>
+        <span style={{color:C.subtle,fontSize:13}}>{open?"▲":"▼"}</span>
+      </button>
+      {!open && <div style={{fontSize:12,color:C.subtle,marginTop:6,paddingLeft:2,fontStyle:"italic"}}>{defaultNote}</div>}
+      {open && <div style={{marginTop:12}} className="fadeIn">{children}</div>}
+    </div>
+  );
+}
+
+function Toggle({ options, value, onChange, small }) {
+  return (
+    <div style={{display:"flex",background:C.bg,border:`1px solid ${C.border}`,borderRadius:10,padding:3}}>
+      {options.map(o=>(
+        <button key={o.id}
+          style={{flex:1,padding:small?"8px 0":"11px 0",background:value===o.id?C.elevated:"transparent",
+            border:"none",borderRadius:8,color:value===o.id?C.white:C.subtle,
+            fontSize:small?13:14,cursor:"pointer",fontFamily:"inherit",fontWeight:value===o.id?600:400,
+            transition:"all 0.15s"}}
+          onClick={()=>onChange(o.id)}>{o.label}</button>
+      ))}
+    </div>
+  );
+}
+
+function SliderField({ label, display, min, max, step, value, onChange, hint, lo, hi }) {
+  return (
+    <div style={F.field}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:10}}>
+        <Label noMargin>{label}</Label>
+        {display && <span style={{fontSize:22,color:C.gold,fontWeight:600}}>{display}</span>}
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={e=>onChange(parseFloat(e.target.value))}
+        className="rng" style={F.range} />
+      {(lo||hi) && <div style={F.rangeEnds}><span>{lo}</span><span>{hi}</span></div>}
+      {hint && <Hint>{hint}</Hint>}
+    </div>
+  );
+}
+
+function Label({ children, noMargin }) {
+  return <div style={{fontSize:12,letterSpacing:"0.1em",textTransform:"uppercase",color:C.muted,fontWeight:600,marginBottom:noMargin?0:8}}>{children}</div>;
+}
+function Hint({ children }) {
+  return <div style={{fontSize:13,color:C.subtle,marginTop:7,lineHeight:1.5}}>{children}</div>;
+}
+function Spacer({ small }) {
+  return <div style={{height:small?8:20}} />;
+}
+function SectionHead({ children }) {
+  return <div style={{fontSize:11,letterSpacing:"0.14em",textTransform:"uppercase",color:C.muted,fontWeight:700,marginBottom:12,marginTop:4}}>{children}</div>;
+}
+function InfoBox({ children }) {
+  return (
+    <div style={{background:C.elevated,border:`1px solid ${C.border}`,borderRadius:10,padding:"12px 14px",fontSize:13,color:C.muted,lineHeight:1.6,marginBottom:16}}>
+      {children}
+    </div>
+  );
+}
+function Card({ children }) {
+  return <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:14,padding:"16px 14px",marginBottom:12}}>{children}</div>;
+}
+function CardHead({ children }) {
+  return <div style={{fontSize:12,letterSpacing:"0.1em",textTransform:"uppercase",color:C.muted,fontWeight:700,marginBottom:12}}>{children}</div>;
+}
+function Bdg({ children }) {
+  return <span style={{background:C.elevated,borderRadius:20,padding:"2px 10px",fontSize:11,color:C.gold,letterSpacing:"0.06em",marginLeft:8}}>{children}</span>;
+}
+function ErrBox({ children }) {
+  return <div style={{background:"#2A0E0A",border:`1px solid ${C.red}55`,borderRadius:8,padding:"10px 14px",fontSize:13,color:C.red,marginBottom:16}}>{children}</div>;
+}
+function Select({ value, onChange, children }) {
+  return (
+    <select style={F.sel} value={value} onChange={e=>onChange(e.target.value)}>
+      {children}
+    </select>
+  );
+}
+function TextInput({ value, onChange, placeholder }) {
+  return <input type="text" style={{...F.sel,marginTop:8}} value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder} />;
+}
+function NumInput({ value, onChange, min, max, placeholder }) {
+  return <input type="number" style={{...F.sel,marginTop:8}} value={value} min={min} max={max} onChange={e=>onChange(+e.target.value)} placeholder={placeholder} />;
+}
+function Stepper({ value, onChange, min=1 }) {
+  return (
+    <div style={{display:"flex",alignItems:"center"}}>
+      <button style={F.stepBtn} onClick={()=>onChange(Math.max(min,value-1))}>−</button>
+      <span style={{width:44,textAlign:"center",fontSize:22,color:C.white,fontWeight:600}}>{value}</span>
+      <button style={F.stepBtn} onClick={()=>onChange(value+1)}>+</button>
+    </div>
+  );
+}
+function Chip({ children, active, onClick }) {
+  return (
+    <button onClick={onClick} style={{padding:"8px 14px",background:active?C.elevated:C.bg,
+      border:`1px solid ${active?C.gold+"66":C.border}`,borderRadius:20,
+      color:active?C.gold:C.muted,fontSize:13,cursor:"pointer",fontFamily:"inherit",fontWeight:active?600:400}}>
+      {children}
+    </button>
+  );
+}
+function Tile({ label, big, sub, highlight }) {
+  return (
+    <div style={{background:C.elevated,border:`1px solid ${highlight?C.borderHi:C.border}`,borderRadius:12,padding:"14px 12px"}}>
+      <div style={{fontSize:10,letterSpacing:"0.12em",textTransform:"uppercase",color:C.subtle,marginBottom:6,fontWeight:600}}>{label}</div>
+      <div style={{fontSize:24,color:highlight?C.gold:C.white,fontWeight:700,marginBottom:4,lineHeight:1}}>{big}</div>
+      <div style={{fontSize:11,color:C.subtle}}>{sub}</div>
+    </div>
+  );
+}
+function BigPill({ label, g, color }) {
+  return (
+    <div style={{flex:1,border:`1.5px solid ${color}44`,background:`${color}12`,borderRadius:10,padding:"10px 6px",textAlign:"center",minWidth:64}}>
+      <div style={{width:6,height:6,borderRadius:"50%",background:color,margin:"0 auto 6px"}}/>
+      <div style={{fontSize:10,letterSpacing:"0.08em",textTransform:"uppercase",color:C.muted,marginBottom:3}}>{label}</div>
+      <div style={{fontSize:20,color:C.white,fontWeight:700}}>{g}g</div>
+    </div>
+  );
+}
+function PlusSign() { return <span style={{color:C.border,fontSize:16,alignSelf:"center"}}>+</span>; }
+function TBlock({ icon, label, time, sub, gold, warn }) {
+  return (
+    <div style={{background:C.elevated,border:`1px solid ${gold?C.gold+"44":warn?"#8A4020":""+C.border}`,borderRadius:10,padding:"10px 8px",textAlign:"center",minWidth:88,flex:1}}>
+      <div style={{fontSize:18,marginBottom:3}}>{icon}</div>
+      <div style={{fontSize:9,letterSpacing:"0.1em",textTransform:"uppercase",color:C.subtle,marginBottom:3,fontWeight:600}}>{label}</div>
+      <div style={{fontSize:16,color:gold?C.gold:C.white,fontWeight:700,marginBottom:2}}>{time}</div>
+      <div style={{fontSize:10,color:C.subtle}}>{sub}</div>
+    </div>
+  );
+}
+function FbBtn({ icon, label, color, onClick }) {
+  return (
+    <button onClick={onClick} style={{flex:1,padding:"12px 4px",background:`${color}18`,
+      border:`1.5px solid ${color}55`,borderRadius:10,color:color,
+      fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit",textAlign:"center"}}>
+      <div style={{fontSize:20,marginBottom:4}}>{icon}</div>
+      {label}
+    </button>
+  );
+}
+function HydRow({ label, val, big, gold }) {
+  return (
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+      <span style={{fontSize:big?14:13,color:big?C.white:C.muted,fontWeight:big?600:400}}>{label}</span>
+      <span style={{fontSize:big?28:15,color:gold?C.gold:C.white,fontWeight:big?700:400}}>{val}</span>
+    </div>
+  );
+}
+function HistPill({ label, val }) {
+  return (
+    <div style={{background:C.elevated,borderRadius:6,padding:"3px 8px",display:"inline-flex",gap:5,alignItems:"center"}}>
+      <span style={{fontSize:10,color:C.subtle,textTransform:"uppercase",letterSpacing:"0.06em"}}>{label}</span>
+      <span style={{fontSize:12,color:C.white,fontWeight:600}}>{val}</span>
+    </div>
+  );
+}
+
+// ─── HINTS ───────────────────────────────────────────────────────────────────
+function tempHint(t) {
+  if (t<=16) return "Very cool — starter will be very slow";
+  if (t<=19) return "Cool kitchen — expect slower activity";
+  if (t<=22) return "Mild — reliable standard conditions";
+  if (t<=25) return "Warm — starter will be lively";
+  if (t<=28) return "Hot — things will move fast";
+  return "Very hot — watch it closely";
+}
+function baseFlourHint(k) {
+  if (k==="ap")    return "Reliable and consistent. Slightly slower than bread flour.";
+  if (k==="bread") return "Higher protein, stronger structure. Solid performer.";
+  if (k==="wm")    return "Rich in nutrients, faster early activity, deeper flavour.";
+  if (k==="rye")   return "100% rye — fast early activity, earthy flavour, lower total CO₂.";
+}
+function boostHint(pct) {
+  if (pct<=10) return "Light boost — subtle speedup, no real flavour change";
+  if (pct<=20) return "Sweet spot — noticeable boost, minimal flavour impact";
+  if (pct<=35) return "Strong boost — faster peak, some earthy notes";
+  return "Heavy addition — significantly faster, noticeably different flavour";
+}
+
+// ─── LAYOUT STYLES ───────────────────────────────────────────────────────────
+const R = {
+  root:      { minHeight:"100vh", background:C.bg, color:C.white, fontFamily:"system-ui,-apple-system,'Helvetica Neue',sans-serif", paddingBottom:80 },
+  header:    { padding:"36px 20px 20px", textAlign:"center", borderBottom:`1px solid ${C.border}` },
+  eyebrow:   { fontSize:11, letterSpacing:"0.22em", textTransform:"uppercase", color:C.goldDim, marginBottom:8, fontWeight:700 },
+  titleRow:  { display:"flex", justifyContent:"center", gap:10, alignItems:"baseline", marginBottom:4 },
+  title:     { fontSize:"clamp(28px,8vw,42px)", fontWeight:300, margin:0, color:C.white, letterSpacing:"-0.02em" },
+  titleGold: { fontSize:"clamp(28px,8vw,42px)", fontWeight:700, margin:0, color:C.gold, letterSpacing:"-0.02em" },
+  clockRow:  { marginTop:12, display:"flex", justifyContent:"center" },
+  clock:     { display:"inline-flex", alignItems:"center", gap:10, background:C.surface, border:`1px solid ${C.border}`, borderRadius:24, padding:"7px 14px" },
+  clockTime: { fontSize:17, color:C.white, fontWeight:600, fontVariantNumeric:"tabular-nums" },
+  tzBtn:     { background:"transparent", border:`1px solid ${C.border}`, borderRadius:14, padding:"4px 10px", fontSize:12, color:C.muted, cursor:"pointer", fontFamily:"inherit", whiteSpace:"nowrap" },
+  tzPicker:  { background:C.surface, border:`1px solid ${C.border}`, borderRadius:14, padding:8, marginTop:8, display:"flex", flexDirection:"column", gap:2, maxHeight:260, overflowY:"auto" },
+  tzOption:  { background:"transparent", border:"none", borderRadius:8, padding:"9px 12px", color:C.muted, fontSize:13, cursor:"pointer", fontFamily:"inherit", textAlign:"left" },
+  tzOptionActive: { background:C.elevated, color:C.white, fontWeight:600 },
+  biasBadge: { display:"inline-flex", alignItems:"center", gap:8, marginTop:8, background:C.elevated, border:`1px solid ${C.borderHi}`, borderRadius:20, padding:"5px 12px", fontSize:12, color:C.muted },
+  biasReset: { background:"transparent", border:`1px solid ${C.border}`, borderRadius:10, padding:"2px 8px", fontSize:11, color:C.subtle, cursor:"pointer", fontFamily:"inherit" },
+  settingsBtn: { background:"transparent", border:`1px solid ${C.border}`, borderRadius:20, padding:"7px 12px", fontSize:18, cursor:"pointer", lineHeight:1 },
+  settingsPanel: { background:C.surface, border:`1px solid ${C.border}`, borderRadius:14, padding:16, marginTop:12, textAlign:"left" },
+  settingsTitle: { fontSize:12, letterSpacing:"0.12em", textTransform:"uppercase", color:C.muted, fontWeight:700, marginBottom:16 },
+  tabBar:    { display:"flex", borderBottom:`1px solid ${C.border}`, background:C.surface, position:"sticky", top:0, zIndex:10 },
+  tabBtn:    { flex:1, padding:"10px 4px 9px", background:"transparent", border:"none", borderBottom:`2px solid transparent`, color:C.subtle, cursor:"pointer", fontFamily:"inherit", display:"flex", flexDirection:"column", alignItems:"center", gap:2, transition:"all 0.15s" },
+  tabActive: { color:C.gold, borderBottom:`2px solid ${C.gold}` },
+  tabIcon:   { fontSize:18 },
+  tabLabel:  { fontSize:10, letterSpacing:"0.06em", fontWeight:600, textTransform:"uppercase" },
+  body:      { maxWidth:520, margin:"0 auto", padding:"24px 16px 0" },
+};
+
+const F = {
+  field:    { marginBottom:20 },
+  row:      { display:"flex", gap:14, marginBottom:20, alignItems:"flex-start" },
+  chipRow:  { display:"flex", gap:8, flexWrap:"wrap", marginBottom:6 },
+  range:    { width:"100%", height:5, appearance:"none", background:C.border, borderRadius:3, outline:"none", cursor:"pointer", display:"block", marginBottom:2 },
+  rangeEnds:{ display:"flex", justifyContent:"space-between", fontSize:11, color:C.subtle, marginTop:4 },
+  sel:      { width:"100%", padding:"12px 14px", background:C.surface, border:`1.5px solid ${C.border}`, borderRadius:10, color:C.white, fontSize:15, fontFamily:"inherit", outline:"none", boxSizing:"border-box", display:"block", appearance:"auto" },
+  goBtn:    { width:"100%", padding:"16px 0", background:C.gold, border:"none", borderRadius:12, color:C.bg, fontSize:16, fontFamily:"inherit", fontWeight:700, cursor:"pointer", letterSpacing:"0.03em", marginTop:4, marginBottom:4 },
+  timerBtn: { padding:"11px 24px", background:C.gold, border:"none", borderRadius:10, color:C.bg, fontSize:14, fontFamily:"inherit", fontWeight:700, cursor:"pointer" },
+  stepBtn:  { width:40, height:40, background:C.elevated, border:`1px solid ${C.border}`, color:C.white, fontSize:20, cursor:"pointer", fontFamily:"inherit", borderRadius:8, fontWeight:600 },
+  results:  { marginTop:24 },
+  tiles:    { display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:12 },
+  // Time display row under time pickers
+  timeDisplay: { display:"flex", alignItems:"center", gap:8, marginTop:10, padding:"8px 12px", background:C.elevated, borderRadius:8, flexWrap:"wrap" },
+  timeNow:  { fontSize:13, color:C.muted },
+  timeArrow:{ fontSize:13, color:C.border },
+  timeMix:  { fontSize:13, color:C.gold, fontWeight:600 },
+  timeWindow:{ fontSize:12, color:C.green, marginLeft:"auto", fontWeight:600 },
+  pillRow:  { display:"flex", alignItems:"center", gap:6, marginBottom:14, flexWrap:"wrap" },
+  divider:  { borderTop:`1px solid ${C.border}`, margin:"12px 0" },
+  outRow:   { display:"flex", alignItems:"center" },
+  outBlock: { flex:1, textAlign:"center" },
+  outLabel: { fontSize:10, letterSpacing:"0.1em", textTransform:"uppercase", color:C.subtle, marginBottom:5, fontWeight:600 },
+  outVal:   { fontSize:28, color:C.white, fontWeight:700, marginBottom:2 },
+  outSub:   { fontSize:11, color:C.subtle },
+  outArrow: { color:C.border, fontSize:20, padding:"0 6px", paddingBottom:14 },
+  timeline: { display:"flex", alignItems:"center", marginBottom:14, gap:0 },
+  tBar:     { flex:1, height:2, background:C.border },
+  fbNote:   { fontSize:13, color:C.muted, marginBottom:12, lineHeight:1.5 },
+  fbRow:    { display:"flex", gap:8 },
+  flourTag: { display:"flex", alignItems:"center", gap:8, background:C.elevated, border:`1px solid ${C.border}`, borderRadius:10, padding:"9px 12px", marginBottom:12, fontSize:13 },
+  histRow:  { display:"flex", alignItems:"center", gap:10 },
+  histIcon: { width:38, height:38, borderRadius:10, display:"flex", alignItems:"center", justifyContent:"center", fontSize:18, flexShrink:0 },
+};
+
+const CSS = `
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+  .rng::-webkit-slider-thumb { appearance:none; width:22px; height:22px; border-radius:50%; background:${C.gold}; cursor:pointer; border:3px solid ${C.bg}; box-shadow:0 0 0 2px ${C.borderHi}; }
+  .rng::-moz-range-thumb { width:22px; height:22px; border-radius:50%; background:${C.gold}; cursor:pointer; border:3px solid ${C.bg}; }
+  .goBtn:active { opacity:0.88; transform:scale(0.99); }
+  .fadeIn { animation:fi 0.25s ease; }
+  @keyframes fi { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:none; } }
+  select option { background:${C.surface}; color:${C.white}; }
+  input[type="time"] { color-scheme:dark; }
+  input[type="number"]::-webkit-inner-spin-button { opacity:1; }
+`;
+
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+</script>
+</body>
+</html>
