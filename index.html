@@ -534,7 +534,7 @@ function makeSpacer(small){var d=document.createElement('div');d.className=small
 function makeInfoBox(html){var d=div('info-box');d.innerHTML=html;return d;}
 function makeErrBox(text){return div('err-box',text);}
 function makeBdg(text){return div('bdg',text);}
-
+ 
 function makeToggle(options,current,onChange,small){
   var wrap=div('toggle'+(small?' small':''));
   options.forEach(function(o){
